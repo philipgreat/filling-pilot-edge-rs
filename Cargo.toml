@@ -1,0 +1,32 @@
+[package]
+name = "filling-pilot-edge"
+version = "0.1.0"
+edition = "2021"
+authors = ["Double Chain Tech"]
+description = "Filling Pilot Edge - Industrial IoT Edge Computing for PLC Data Collection"
+license = "Apache-2.0"
+repository = "https://github.com/philipgreat/filling-pilot-edge-rs"
+keywords = ["plc", "s7", "siemens", "iot", "edge", "industrial"]
+categories = ["network-programming", "hardware-support", "api-bindings"]
+
+[dependencies]
+tokio = { version = "1", features = ["full", "rt-multi-thread"] }
+s7-connector = { path = "../s7connector-rs" }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+config = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+byteorder = "1"
+thiserror = "2"
+bytes = "1"
+
+[build-dependencies]
+
+[[bin]]
+name = "filling-pilot-edge"
+path = "src/main.rs"

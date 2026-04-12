@@ -1,0 +1,34 @@
+syntax = "proto3"; // 定义语法类型
+
+
+package pilot; // 定义作用域
+option java_multiple_files = false; // 表示下面的message不需要编译成多个java文件
+option java_outer_classname = "Pilot"; // 表示下面的message编译成的java类文件的名字
+option java_package = "grpc"; //指定该proto文件编译成的java源文件的包名
+
+import "google/protobuf/empty.proto";
+service fillingPilot {
+  rpc register(ECNInfo) returns (stream ServerCommand){}
+  rpc heartBeat(ECNInfo) returns (ServerCommand){}
+  rpc send(stream PlcResponse) returns (google.protobuf.Empty) {}
+}
+
+message ECNInfo {
+  string id = 1; //ecn id
+  int64 randomNumber = 4;
+  string sign = 5;
+}
+
+message PlcResponse {// 定义请求的消息体
+  string id = 1; //ecn id
+  string type = 2; //消息类型
+  string plcId = 3; //plc id
+  int64 randomNumber = 4;
+  string sign = 5;
+  string message = 6; //内容
+}
+
+message ServerCommand {// 定义服务器命令
+  string type = 1; //消息类型
+  string detail = 3;
+}
