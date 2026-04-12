@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io;
+use std::path::Path;
 
 /// Application context loaded from configuration files
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,16 +105,75 @@ impl Context {
     /// 
     /// Reads `id` file for id and private_key
     /// Reads `serverConf` file for server configuration
-    pub fn load() -> std::result::Result<Self, Box<dyn std::error::Error>> {
+    /// 
+    /// Files are read from the current working directory (std::env::current_dir).
+    /// Expected file paths:
+    ///   - `./id` (required) - must contain JSON with `id` field
+    ///   - `./serverConf` (optional) - additional server configuration
+    pub fn load() -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        
+        let id_path = "id";
+        let server_conf_path = "serverConf";
+        
         // Read id file
-        let id_content = fs::read_to_string("id")?;
-        let mut ctx: Context = serde_json::from_str(&id_content)?;
+        let id_content = match fs::read_to_string(id_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to read `id` file: {}\n  \
+                     Expected path: {}/{}\n  \
+                     Working directory: {}\n  \
+                     Hint: Place the `id` file in the current working directory, \
+                     or run the program from the directory containing `id`.",
+                    e, cwd, id_path, cwd
+                ).into());
+            }
+        };
+        
+        let mut ctx: Context = match serde_json::from_str::<serde_json::Value>(&id_content) {
+            Ok(v) => serde_json::from_value(v)?,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to parse `id` file as JSON: {}\n  \
+                     Expected path: {}/{}\n  \
+                     Working directory: {}\n  \
+                     Content preview: {}",
+                    e, cwd, id_path, cwd,
+                    &id_content.chars().take(200).collect::<String>()
+                ).into());
+            }
+        };
+        
+        // Check required `id` field
+        if ctx.id.is_empty() {
+            return Err(format!(
+                "Missing required field `id` in `id` file.\n  \
+                 Expected path: {}/{}\n  \
+                 Working directory: {}\n  \
+                 The `id` file must contain: {{\"id\": \"your-node-id\"}}",
+                cwd, id_path, cwd
+            ).into());
+        }
 
         // Read serverConf file if exists
-        if let Ok(server_conf_content) = fs::read_to_string("serverConf") {
-            let server_conf: Context = serde_json::from_str(&server_conf_content)?;
-            // Merge server config (but preserve id and private_key)
-            ctx.merge_server_conf(&server_conf);
+        if let Ok(server_conf_content) = fs::read_to_string(server_conf_path) {
+            match serde_json::from_str::<serde_json::Value>(&server_conf_content) {
+                Ok(v) => {
+                    let server_conf: Context = serde_json::from_value(v)?;
+                    ctx.merge_server_conf(&server_conf);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to parse `serverConf` file as JSON: {}\n  \
+                         Expected path: {}/{}\n  \
+                         Working directory: {}",
+                        e, cwd, server_conf_path, cwd
+                    ).into());
+                }
+            }
         }
 
         Ok(ctx)
