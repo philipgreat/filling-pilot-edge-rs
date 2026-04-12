@@ -1,4 +1,5 @@
 /target/
+filling-pilot-edge
 Cargo.lock
 **/*.rs.bk
 .idea/

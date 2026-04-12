@@ -4,8 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io;
-use std::path::Path;
+use thiserror::Error;
 
 /// Application context loaded from configuration files
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +99,42 @@ impl Default for Context {
     }
 }
 
+/// Context loading errors with full path information
+#[derive(Debug, Error)]
+pub enum ContextError {
+    #[error("Failed to read `id` file: {source}\n  Expected path: {id_path}\n  Working directory: {cwd}\n  Hint: Place the `id` file in the current working directory, or run the program from the directory containing `id`.")]
+    IdFileNotFound {
+        #[source]
+        source: std::io::Error,
+        id_path: String,
+        cwd: String,
+    },
+
+    #[error("Failed to parse `id` file as JSON: {source}\n  Expected path: {id_path}\n  Working directory: {cwd}\n  Content preview: {preview}")]
+    IdFileInvalidJson {
+        #[source]
+        source: serde_json::Error,
+        id_path: String,
+        cwd: String,
+        preview: String,
+    },
+
+    #[error("Missing required field `{field}` in `id` file.\n  Expected path: {id_path}\n  Working directory: {cwd}\n  Hint: The `id` file must contain: {{\"id\": \"your-node-id\"}}")]
+    MissingField {
+        field: &'static str,
+        id_path: String,
+        cwd: String,
+    },
+
+    #[error("Failed to read `serverConf` file: {source}\n  Expected path: {conf_path}\n  Working directory: {cwd}")]
+    ServerConfFileInvalid {
+        #[source]
+        source: serde_json::Error,
+        conf_path: String,
+        cwd: String,
+    },
+}
+
 impl Context {
     /// Load context from configuration files
     /// 
@@ -110,68 +145,55 @@ impl Context {
     /// Expected file paths:
     ///   - `./id` (required) - must contain JSON with `id` field
     ///   - `./serverConf` (optional) - additional server configuration
-    pub fn load() -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn load() -> Result<Self, ContextError> {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "<unknown>".to_string());
-        
-        let id_path = "id";
-        let server_conf_path = "serverConf";
-        
+
+        let id_path = format!("{}/id", cwd);
+        let server_conf_path = format!("{}/serverConf", cwd);
+
         // Read id file
-        let id_content = match fs::read_to_string(id_path) {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(format!(
-                    "Failed to read `id` file: {}\n  \
-                     Expected path: {}/{}\n  \
-                     Working directory: {}\n  \
-                     Hint: Place the `id` file in the current working directory, \
-                     or run the program from the directory containing `id`.",
-                    e, cwd, id_path, cwd
-                ).into());
+        let id_content = fs::read_to_string("id").map_err(|source| ContextError::IdFileNotFound {
+            source,
+            id_path: id_path.clone(),
+            cwd: cwd.clone(),
+        })?;
+
+        // Parse as generic JSON value first
+        let json_value: serde_json::Value = serde_json::from_str(&id_content)
+            .map_err(|source| ContextError::IdFileInvalidJson {
+                source,
+                id_path: id_path.clone(),
+                cwd: cwd.clone(),
+                preview: id_content.chars().take(200).collect(),
+            })?;
+
+        // Deserialize into Context
+        let mut ctx: Context = serde_json::from_value(json_value).map_err(|_source| {
+            ContextError::MissingField {
+                field: "id",
+                id_path: id_path.clone(),
+                cwd: cwd.clone(),
             }
-        };
-        
-        let mut ctx: Context = match serde_json::from_str::<serde_json::Value>(&id_content) {
-            Ok(v) => serde_json::from_value(v)?,
-            Err(e) => {
-                return Err(format!(
-                    "Failed to parse `id` file as JSON: {}\n  \
-                     Expected path: {}/{}\n  \
-                     Working directory: {}\n  \
-                     Content preview: {}",
-                    e, cwd, id_path, cwd,
-                    &id_content.chars().take(200).collect::<String>()
-                ).into());
-            }
-        };
-        
-        // Check required `id` field
+        })?;
+
+        // Validate required id field
         if ctx.id.is_empty() {
-            return Err(format!(
-                "Missing required field `id` in `id` file.\n  \
-                 Expected path: {}/{}\n  \
-                 Working directory: {}\n  \
-                 The `id` file must contain: {{\"id\": \"your-node-id\"}}",
-                cwd, id_path, cwd
-            ).into());
+            return Err(ContextError::MissingField {
+                field: "id",
+                id_path: id_path.clone(),
+                cwd: cwd.clone(),
+            });
         }
 
-        // Read serverConf file if exists
-        if let Ok(server_conf_content) = fs::read_to_string(server_conf_path) {
-            match serde_json::from_str::<serde_json::Value>(&server_conf_content) {
-                Ok(v) => {
-                    let server_conf: Context = serde_json::from_value(v)?;
+        // Read serverConf file if exists (optional, ignore errors)
+        if let Ok(server_conf_content) = fs::read_to_string("serverConf") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&server_conf_content) {
+                if let Ok(server_conf) = serde_json::from_value::<Context>(v) {
                     ctx.merge_server_conf(&server_conf);
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "Failed to parse `serverConf` file as JSON: {}\n  \
-                         Expected path: {}/{}\n  \
-                         Working directory: {}",
-                        e, cwd, server_conf_path, cwd
-                    ).into());
+                } else {
+                    // Non-fatal: just skip serverConf on parse error
                 }
             }
         }
