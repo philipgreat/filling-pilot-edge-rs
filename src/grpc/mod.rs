@@ -1,20 +1,25 @@
-//! gRPC types for Filling Pilot
-//! 
-//! Note: We use JSON serialization instead of protobuf for flexibility
+//! gRPC types and cloud session for Filling Pilot
 
+pub mod cloud;
+
+// Re-export the generated protobuf types
+pub use cloud::pb::{EcnInfo, PlcResponse, ServerCommand};
+pub use cloud::CloudSession;
+
+// Legacy serde-based types (kept for HTTP API compatibility)
 use serde::{Deserialize, Serialize};
 
-/// ECN Info - Edge Node registration info
+/// ECN Info - Edge Node registration info (JSON for HTTP API)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct EcnInfo {
+pub struct EcnInfoJson {
     pub id: String,
     pub random_number: i64,
     pub sign: String,
 }
 
-/// PLC Response - Response from PLC read/write operations
+/// PLC Response - Response from PLC read/write operations (JSON for HTTP API)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PlcResponse {
+pub struct PlcResponseJson {
     pub id: String,
     #[serde(rename = "type")]
     pub msg_type: String,
@@ -25,15 +30,15 @@ pub struct PlcResponse {
     pub message: String,
 }
 
-/// Server Command - Command from cloud server
+/// Server Command - Command from cloud server (JSON for HTTP API)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ServerCommand {
+pub struct ServerCommandJson {
     #[serde(rename = "type")]
     pub cmd_type: String,
     pub detail: String,
 }
 
-impl PlcResponse {
+impl PlcResponseJson {
     /// Create success response
     pub fn success(plc_id: &str, msg_type: &str, message: &str) -> Self {
         Self {
@@ -64,7 +69,7 @@ impl PlcResponse {
     }
 }
 
-impl ServerCommand {
+impl ServerCommandJson {
     /// Parse from JSON string
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)

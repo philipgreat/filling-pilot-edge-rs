@@ -119,6 +119,66 @@ impl S7Manager {
             let _ = conn.disconnect().await;
         }
     }
+
+    /// Test PLC connection status
+    /// Returns (connected, latency_ms)
+    pub async fn test_connection(&self, host: &str, port: u16) -> (bool, Option<u64>) {
+        let start = std::time::Instant::now();
+        
+        // Try to connect and read a small amount of data
+        match self.read_bytes(host, port, 1, 0, 1).await {
+            Ok(_) => {
+                let latency = start.elapsed().as_millis() as u64;
+                (true, Some(latency))
+            }
+            Err(_) => {
+                // Remove failed connection from pool
+                let key = format!("{}:{}", host, port);
+                let mut pool = self.connections.write().await;
+                pool.remove(&key);
+                (false, None)
+            }
+        }
+    }
+
+    /// Get all connection keys in the pool
+    pub async fn get_connection_keys(&self) -> Vec<String> {
+        let pool = self.connections.read().await;
+        pool.keys().cloned().collect()
+    }
+
+    /// Check all connections and return status map
+    pub async fn check_all_connections(&self) -> Vec<PlcConnectionStatus> {
+        let keys = self.get_connection_keys().await;
+        let mut results = Vec::new();
+        
+        for key in keys {
+            let parts: Vec<&str> = key.split(':').collect();
+            if parts.len() == 2 {
+                let host = parts[0];
+                let port: u16 = parts[1].parse().unwrap_or(102);
+                let (connected, latency) = self.test_connection(host, port).await;
+                results.push(PlcConnectionStatus {
+                    host: host.to_string(),
+                    port,
+                    connected,
+                    latency_ms: latency,
+                });
+            }
+        }
+        
+        results
+    }
+}
+
+/// PLC connection status
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlcConnectionStatus {
+    pub host: String,
+    pub port: u16,
+    pub connected: bool,
+    #[serde(rename = "latencyMs")]
+    pub latency_ms: Option<u64>,
 }
 
 impl Default for S7Manager {

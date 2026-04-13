@@ -1,0 +1,31 @@
+syntax = "proto3";
+package pilot;
+option java_multiple_files = false;
+option java_outer_classname = "Pilot";
+option java_package = "grpc";
+import "google/protobuf/empty.proto";
+service fillingPilot {
+  rpc register(ECNInfo) returns (stream ServerCommand){}
+  rpc heartBeat(ECNInfo) returns (ServerCommand){}
+  rpc send(stream PlcResponse) returns (google.protobuf.Empty) {}
+}
+
+message ECNInfo {
+  string id = 1; //ecn id
+  int64 randomNumber = 4;
+  string sign = 5;
+}
+
+message PlcResponse {// 定义请求的消息体
+  string id = 1; //ecn id
+  string type = 2; //消息类型
+  string plcId = 3; //plc id
+  int64 randomNumber = 4;
+  string sign = 5;
+  string message = 6; //内容
+}
+
+message ServerCommand {// 定义服务器命令
+  string type = 1; //消息类型
+  string detail = 3;
+}

@@ -19,6 +19,8 @@ use context::Context;
 use s7::S7Manager;
 use processor::{StatusProcessor, VersionReportProcessor};
 use logger::{Logger, start_memory_reporter};
+use grpc::CloudSession;
+use tokio::time::{interval, Duration};
 
 /// Global logger instance (initialized after context is loaded)
 static LOGGER: std::sync::OnceLock<Arc<Logger>> = std::sync::OnceLock::new();
@@ -102,6 +104,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log_udp!("STARTUP", "HTTP API: http://0.0.0.0:{}", context.local_port);
     log_udp!("STARTUP", "Cloud Server: {}:{}", context.server_address, context.port);
 
+    // Create cloud session and connect
+    let cloud_session = Arc::new(CloudSession::new(&context, Arc::clone(&logger)));
+    
+    // Connect to cloud server
+    match cloud_session.connect().await {
+        Ok(()) => {
+            log_udp!("STARTUP", "Cloud connection established");
+        }
+        Err(e) => {
+            log_udp!("STARTUP", "Cloud connection failed: {}", e);
+        }
+    }
+
+    // Spawn heartbeat loop
+    let heartbeat_session = Arc::clone(&cloud_session);
+    let heartbeat_handle = tokio::spawn(async move {
+        heartbeat_session.start_heartbeat_loop().await;
+    });
+
+    // Spawn register (will block on command stream, so run in background)
+    let register_session = Arc::clone(&cloud_session);
+    let register_handle = tokio::spawn(async move {
+        register_session.register().await;
+    });
+
+    // Spawn PLC connection status checker
+    let plc_s7 = Arc::clone(&s7_manager);
+    let plc_logger = Arc::clone(&logger);
+    let plc_status_handle = tokio::spawn(async move {
+        let mut tick = interval(Duration::from_secs(10)); // Check every 10 seconds
+        loop {
+            tick.tick().await;
+            
+            let statuses = plc_s7.check_all_connections().await;
+            if statuses.is_empty() {
+                // No PLCs configured yet, skip
+                continue;
+            }
+            
+            for status in statuses {
+                let status_str = if status.connected {
+                    format!("PLC {}:{} CONNECTED (latency: {:?}ms)", 
+                        status.host, status.port, status.latency_ms)
+                } else {
+                    format!("PLC {}:{} DISCONNECTED", status.host, status.port)
+                };
+                info!("[PLC_STATUS] {}", status_str);
+                let l = Arc::clone(&plc_logger);
+                let msg = status_str.clone();
+                tokio::spawn(async move { l.log("PLC_STATUS", &msg).await; });
+            }
+        }
+    });
+
     // Wait for shutdown
     tokio::signal::ctrl_c().await?;
     
@@ -109,6 +165,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Shutting down...");
     s7_manager.close_all().await;
     http_handle.abort();
+    heartbeat_handle.abort();
+    register_handle.abort();
+    plc_status_handle.abort();
 
     Ok(())
 }

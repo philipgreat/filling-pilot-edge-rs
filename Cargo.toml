@@ -25,8 +25,19 @@ byteorder = "1"
 thiserror = "2"
 bytes = "1"
 sys-info = "0.9"
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tokio-stream = "0.1"
+tower = "0.5"
+h2 = "0.4"
+k256 = { version = "0.13", features = ["ecdsa", "pem"] }
+sha2 = "0.10"
+base64 = "0.22"
+pem = "3"
 
 [build-dependencies]
+tonic-build = "0.12"
 
 [[bin]]
 name = "filling-pilot-edge"
