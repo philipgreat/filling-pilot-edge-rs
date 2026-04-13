@@ -29,13 +29,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting Filling Pilot Edge v{}", env!("CARGO_PKG_VERSION"));
 
     // Load configuration
-    let (context, cwd, id_path, conf_path) = match Context::load_with_paths() {
-        Ok((ctx, cwd, id_path, conf_path)) => {
+    let (context, cwd, id_path, conf_path, id_content, conf_content) = match Context::load_with_paths() {
+        Ok(result) => {
+            let (ctx, cwd, id_path, conf_path, id_content, conf_content) = result;
             info!("Config directory: {}", cwd);
             info!("Loaded id file: {}", id_path);
+            info!("{}", id_content.trim());
             info!("Loaded serverConf file: {}", conf_path);
+            info!("{}", conf_content.trim());
             info!("ECN: {}", ctx.id);
-            (ctx, cwd, id_path, conf_path)
+            (ctx, cwd, id_path, conf_path, id_content, conf_content)
         }
         Err(e) => {
             error!("{}", e);

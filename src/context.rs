@@ -132,7 +132,7 @@ impl Default for Context {
 /// Context loading errors with full path information
 #[derive(Debug, Error)]
 pub enum ContextError {
-    #[error("Failed to read `id` file: {source}\n  Expected path: {id_path}\n  Working directory: {cwd}\n  Hint: Place the `id` file in the current working directory, or run the program from the directory containing `id`.")]
+    #[error("Required `id` file not found.\n  Expected path: {id_path}\n  Working directory: {cwd}\n  Hint: Place the `id` file in the current working directory.")]
     IdFileNotFound {
         #[source]
         source: std::io::Error,
@@ -156,12 +156,21 @@ pub enum ContextError {
         cwd: String,
     },
 
-    #[error("Failed to read `serverConf` file: {source}\n  Expected path: {conf_path}\n  Working directory: {cwd}")]
+    #[error("Required `serverConf` file not found.\n  Expected path: {conf_path}\n  Working directory: {cwd}\n  Hint: Place the `serverConf` file in the current working directory.")]
+    ServerConfNotFound {
+        #[source]
+        source: std::io::Error,
+        conf_path: String,
+        cwd: String,
+    },
+
+    #[error("Failed to parse `serverConf` file as JSON: {source}\n  Expected path: {conf_path}\n  Working directory: {cwd}\n  Content preview: {preview}")]
     ServerConfFileInvalid {
         #[source]
         source: serde_json::Error,
         conf_path: String,
         cwd: String,
+        preview: String,
     },
 }
 
@@ -174,9 +183,9 @@ impl Context {
     /// Files are read from the current working directory (std::env::current_dir).
     /// Expected file paths:
     ///   - `./id` (required) - must contain JSON with `id` field
-    ///   - `./serverConf` (optional) - additional server configuration
-    /// Returns (context, cwd, id_file_path, server_conf_file_path)
-    pub fn load_with_paths() -> Result<(Self, String, String, String), ContextError> {
+    ///   - `./serverConf` (required) - server configuration
+    /// Returns (context, cwd, id_file_path, server_conf_file_path, id_content, server_conf_content)
+    pub fn load_with_paths() -> Result<(Self, String, String, String, String, String), ContextError> {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "<unknown>".to_string());
@@ -218,19 +227,28 @@ impl Context {
             });
         }
 
-        // Read serverConf file if exists (optional, ignore errors)
-        if let Ok(server_conf_content) = fs::read_to_string("serverConf") {
-            if let Ok(server_conf) = serde_json::from_str::<ServerConf>(&server_conf_content) {
-                ctx.merge_server_conf(&server_conf);
-            }
-        }
+        // Read serverConf file (required)
+        let server_conf_content = fs::read_to_string("serverConf").map_err(|source| ContextError::ServerConfNotFound {
+            source,
+            conf_path: server_conf_path.clone(),
+            cwd: cwd.clone(),
+        })?;
 
-        Ok((ctx, cwd, id_path, server_conf_path))
+        let server_conf: ServerConf = serde_json::from_str(&server_conf_content).map_err(|source| ContextError::ServerConfFileInvalid {
+            source,
+            conf_path: server_conf_path.clone(),
+            cwd: cwd.clone(),
+            preview: server_conf_content.chars().take(200).collect(),
+        })?;
+
+        ctx.merge_server_conf(&server_conf);
+
+        Ok((ctx, cwd, id_path, server_conf_path, id_content, server_conf_content))
     }
 
     /// Convenience wrapper that returns only the context
     pub fn load() -> Result<Self, ContextError> {
-        let (ctx, _, _, _) = Self::load_with_paths()?;
+        let (ctx, _, _, _, _, _) = Self::load_with_paths()?;
         Ok(ctx)
     }
 
