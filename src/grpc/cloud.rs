@@ -298,13 +298,35 @@ impl CloudSession {
         
         match cmd.r#type.as_str() {
             "plcInfo" => {
-                // Parse PLC list from detail and update S7Manager
+                // Parse PLC list from detail
                 let plcs = self.parse_plc_list(&cmd.detail).await;
                 let count = plcs.len();
-                if !plcs.is_empty() {
-                    self.s7_manager.update_plc_list(plcs).await;
+                
+                if plcs.is_empty() {
+                    self.log_udp("PLC_INFO", "No PLCs in config").await;
+                    return;
                 }
-                self.log_udp("CMD", &format!("plcInfo: {} PLCs configured", count)).await;
+                
+                // Update S7Manager with new PLC list
+                self.s7_manager.update_plc_list(plcs.clone()).await;
+                
+                // Test each PLC with TCP socket (like Java PlcInfo.handle)
+                for plc in &plcs {
+                    let result = self.test_tcp_connection(&plc.ip, plc.port).await;
+                    let msg_type = if result { "plcInfo" } else { "plcInfoFail" };
+                    let message = if result { "ok" } else { "failed" };
+                    
+                    // Send response for each PLC: sendPlcResponse(id, "plcInfo", "ok")
+                    self.send_plc_response(&format!("{}:{}", plc.ip, plc.port), msg_type, message).await;
+                    
+                    // Sleep 50ms between each PLC (like Java)
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+                
+                // Send final response: sendPlcResponse("plcInfo", "ok")
+                self.send_plc_response("plcInfo", "plcInfo", "ok").await;
+                
+                self.log_udp("PLC_INFO", &format!("Tested {} PLCs", count)).await;
             }
             "upgrade" => {
                 self.log_udp("CMD", "Received upgrade command (not implemented yet)").await;
@@ -345,6 +367,29 @@ impl CloudSession {
             }
         }
         Vec::new()
+    }
+
+    /// Test TCP connection to PLC (like Java Socket.connect with 3s timeout)
+    async fn test_tcp_connection(&self, host: &str, port: u16) -> bool {
+        let addr = format!("{}:{}", host, port);
+        let timeout = tokio::time::Duration::from_secs(3);
+        
+        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
+            Ok(Ok(_stream)) => {
+                info!("[TCP_TEST] {}:{} connected", host, port);
+                true
+            }
+            Ok(Err(e)) => {
+                warn!("[TCP_TEST] {}:{} failed: {}", host, port, e);
+                self.log_udp("TCP_TEST", &format!("connect to {}:{} failed: {}", host, port, e)).await;
+                false
+            }
+            Err(_) => {
+                warn!("[TCP_TEST] {}:{} timeout (3s)", host, port);
+                self.log_udp("TCP_TEST", &format!("connect to {}:{} timeout", host, port)).await;
+                false
+            }
+        }
     }
 
     /// Send PLC response to cloud server via gRPC send() method
