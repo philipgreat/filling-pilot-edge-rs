@@ -6,6 +6,36 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use thiserror::Error;
 
+/// Server configuration (from `serverConf` file)
+/// Does not require `id` field
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerConf {
+    pub server_address: String,
+    pub port: u16,
+    #[serde(default = "default_heartbeat")]
+    pub heart_beat: u64,
+    #[serde(default = "default_report_interval")]
+    pub report_interval: u64,
+    #[serde(default = "default_status_interval")]
+    pub status_interval: u64,
+    #[serde(default = "default_local_port")]
+    pub local_port: u16,
+}
+
+impl Default for ServerConf {
+    fn default() -> Self {
+        Self {
+            server_address: default_server_address(),
+            port: default_port(),
+            heart_beat: default_heartbeat(),
+            report_interval: default_report_interval(),
+            status_interval: default_status_interval(),
+            local_port: default_local_port(),
+        }
+    }
+}
+
 /// Application context loaded from configuration files
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Context {
@@ -190,12 +220,8 @@ impl Context {
 
         // Read serverConf file if exists (optional, ignore errors)
         if let Ok(server_conf_content) = fs::read_to_string("serverConf") {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&server_conf_content) {
-                if let Ok(server_conf) = serde_json::from_value::<Context>(v) {
-                    ctx.merge_server_conf(&server_conf);
-                } else {
-                    // Non-fatal: just skip serverConf on parse error
-                }
+            if let Ok(server_conf) = serde_json::from_str::<ServerConf>(&server_conf_content) {
+                ctx.merge_server_conf(&server_conf);
             }
         }
 
@@ -209,31 +235,13 @@ impl Context {
     }
 
     /// Merge server configuration
-    fn merge_server_conf(&mut self, server_conf: &Context) {
-        if !server_conf.server_address.is_empty() {
-            self.server_address = server_conf.server_address.clone();
-        }
-        if server_conf.port != default_port() {
-            self.port = server_conf.port;
-        }
-        if server_conf.upgrade_url.is_some() {
-            self.upgrade_url = server_conf.upgrade_url.clone();
-        }
-        if server_conf.server_conf_url.is_some() {
-            self.server_conf_url = server_conf.server_conf_url.clone();
-        }
-        if server_conf.heart_beat != default_heartbeat() {
-            self.heart_beat = server_conf.heart_beat;
-        }
-        if server_conf.report_interval != default_report_interval() {
-            self.report_interval = server_conf.report_interval;
-        }
-        if server_conf.status_interval != default_status_interval() {
-            self.status_interval = server_conf.status_interval;
-        }
-        if server_conf.local_port != default_local_port() {
-            self.local_port = server_conf.local_port;
-        }
+    fn merge_server_conf(&mut self, server_conf: &ServerConf) {
+        self.server_address = server_conf.server_address.clone();
+        self.port = server_conf.port;
+        self.heart_beat = server_conf.heart_beat;
+        self.report_interval = server_conf.report_interval;
+        self.status_interval = server_conf.status_interval;
+        self.local_port = server_conf.local_port;
     }
 }
 
@@ -260,5 +268,22 @@ mod tests {
         assert_eq!(ctx.id, "test-123");
         assert_eq!(ctx.server_address, "192.168.1.100");
         assert_eq!(ctx.port, 8888);
+    }
+
+    #[test]
+    fn test_server_conf_camelcase() {
+        let json = r#"{
+            "serverAddress": "cms.think-to.com",
+            "port": 9999,
+            "heartBeat": 5000,
+            "reportInterval": 5000,
+            "statusInterval": 1000,
+            "localPort": 22222
+        }"#;
+        let conf: ServerConf = serde_json::from_str(json).unwrap();
+        assert_eq!(conf.server_address, "cms.think-to.com");
+        assert_eq!(conf.port, 9999);
+        assert_eq!(conf.heart_beat, 5000);
+        assert_eq!(conf.local_port, 22222);
     }
 }
