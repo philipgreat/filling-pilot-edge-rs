@@ -29,14 +29,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting Filling Pilot Edge v{}", env!("CARGO_PKG_VERSION"));
 
     // Load configuration
-    let context = match Context::load() {
-        Ok(ctx) => {
+    let (context, cwd, id_path, conf_path) = match Context::load_with_paths() {
+        Ok((ctx, cwd, id_path, conf_path)) => {
+            info!("Config directory: {}", cwd);
+            info!("Loaded id file: {}", id_path);
+            info!("Loaded serverConf file: {}", conf_path);
             info!("ECN: {}", ctx.id);
-            ctx
+            (ctx, cwd, id_path, conf_path)
         }
         Err(e) => {
-            error!("Config error: {}", e);
-            eprintln!("Error: Please ensure 'id' and 'serverConf' files exist");
+            error!("{}", e);
             std::process::exit(1);
         }
     };

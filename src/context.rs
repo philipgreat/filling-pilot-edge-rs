@@ -145,7 +145,8 @@ impl Context {
     /// Expected file paths:
     ///   - `./id` (required) - must contain JSON with `id` field
     ///   - `./serverConf` (optional) - additional server configuration
-    pub fn load() -> Result<Self, ContextError> {
+    /// Returns (context, cwd, id_file_path, server_conf_file_path)
+    pub fn load_with_paths() -> Result<(Self, String, String, String), ContextError> {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "<unknown>".to_string());
@@ -198,6 +199,12 @@ impl Context {
             }
         }
 
+        Ok((ctx, cwd, id_path, server_conf_path))
+    }
+
+    /// Convenience wrapper that returns only the context
+    pub fn load() -> Result<Self, ContextError> {
+        let (ctx, _, _, _) = Self::load_with_paths()?;
         Ok(ctx)
     }
 
