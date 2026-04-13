@@ -10,6 +10,7 @@ pub mod grpc;
 pub mod s7;
 pub mod http;
 pub mod error;
+pub mod logger;
 
 pub use context::Context;
 pub use error::{Error, Result};
