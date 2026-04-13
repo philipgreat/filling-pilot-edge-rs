@@ -173,8 +173,14 @@ impl CloudSession {
                 while let Some(cmd) = stream.next().await {
                     match cmd {
                         Ok(cmd) => {
-                            info!("[CMD] type={} detail={}", cmd.r#type, cmd.detail);
-                            self.log_udp("CMD", &format!("type={} detail={}", cmd.r#type, cmd.detail)).await;
+                            // Log command type and PLC summary only
+                            let plc_summary = if !cmd.detail.is_empty() {
+                                format!(" plc={}", self.extract_plc_summary(&cmd.detail))
+                            } else {
+                                String::new()
+                            };
+                            info!("[CMD] type={}{}", cmd.r#type, plc_summary);
+                            self.log_udp("CMD", &format!("type={}{}", cmd.r#type, plc_summary)).await;
                             self.handle_command(&cmd).await;
                         }
                         Err(e) => {
@@ -224,13 +230,61 @@ impl CloudSession {
                 info!("[HEARTBEAT] OK, server response: type={}", cmd.r#type);
                 self.log_udp("HEARTBEAT", &format!("OK (id={}, random={})", self.id, self.random_number)).await;
                 if !cmd.detail.is_empty() {
-                    self.log_udp("HEARTBEAT", &format!("  detail={}", cmd.detail)).await;
+                    // Parse detail and extract only PLC info (ipAddress, portNumber)
+                    let plc_summary = self.extract_plc_summary(&cmd.detail);
+                    self.log_udp("HEARTBEAT", &format!("plc={}", plc_summary)).await;
                 }
             }
             Err(e) => {
                 warn!("[HEARTBEAT] failed: {}", e);
                 self.log_udp("HEARTBEAT", &format!("FAILED: {}", e)).await;
             }
+        }
+    }
+
+    /// Extract PLC summary (ipAddress:portNumber) from detail JSON
+    /// Returns a compact string like "192.168.1.10:102, 192.168.1.11:102"
+    fn extract_plc_summary(&self, detail: &str) -> String {
+        // Try to parse as JSON and extract PLC info
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(detail) {
+            let mut plcs = Vec::new();
+            
+            // Try array format: [{"ipAddress":"...", "portNumber":...}, ...]
+            if let Some(arr) = json.as_array() {
+                for item in arr {
+                    if let (Some(ip), Some(port)) = (
+                        item.get("ipAddress").and_then(|v| v.as_str()),
+                        item.get("portNumber").and_then(|v| v.as_u64())
+                    ) {
+                        plcs.push(format!("{}:{}", ip, port));
+                    }
+                }
+            }
+            
+            // Try dataMeta format: {"dataMeta":[{"ipAddress":"...", ...}]}
+            if plcs.is_empty() {
+                if let Some(data_meta) = json.get("dataMeta").and_then(|v| v.as_array()) {
+                    for item in data_meta {
+                        if let (Some(ip), Some(port)) = (
+                            item.get("ipAddress").and_then(|v| v.as_str()),
+                            item.get("portNumber").and_then(|v| v.as_u64())
+                        ) {
+                            plcs.push(format!("{}:{}", ip, port));
+                        }
+                    }
+                }
+            }
+            
+            if !plcs.is_empty() {
+                return plcs.join(", ");
+            }
+        }
+        
+        // Fallback: return first 50 chars if can't parse
+        if detail.len() > 50 {
+            format!("{}...", &detail[..50])
+        } else {
+            detail.to_string()
         }
     }
 
