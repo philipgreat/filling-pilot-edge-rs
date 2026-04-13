@@ -24,6 +24,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::context::Context;
 use crate::logger::Logger;
+use crate::s7::PlcConnectionStatus;
 
 /// Cloud session - manages gRPC connection to cloud server
 pub struct CloudSession {
@@ -255,6 +256,52 @@ impl CloudSession {
                 self.log_udp("CMD", &format!("Unknown command type: {}", cmd.r#type)).await;
             }
         }
+    }
+
+    /// Send PLC response to cloud server via gRPC send() method
+    /// 
+    /// This is called when PLC status changes or data needs to be reported.
+    /// Uses bidirectional streaming to send PlcResponse messages.
+    pub async fn send_plc_response(&self, plc_id: &str, msg_type: &str, message: &str) {
+        let plc_response = pb::PlcResponse {
+            id: self.id.clone(),
+            plc_id: plc_id.to_string(),
+            r#type: msg_type.to_string(),
+            random_number: self.random_number,
+            sign: self.sign(self.random_number),
+            message: message.to_string(),
+        };
+
+        let mut guard = self.client.write().await;
+        let client = match guard.as_mut() {
+            Some(c) => c,
+            None => {
+                warn!("[SEND] Not connected to cloud server");
+                return;
+            }
+        };
+
+        // Create a stream with single message
+        let stream = tokio_stream::once(plc_response);
+        let req = tonic::Request::new(stream);
+
+        match client.send(req).await {
+            Ok(_) => {
+                info!("[SEND] PLC response sent: type={}, plcId={}", msg_type, plc_id);
+                self.log_udp("SEND", &format!("sent {} for {}", msg_type, plc_id)).await;
+            }
+            Err(e) => {
+                warn!("[SEND] Failed to send: {}", e);
+                self.log_udp("SEND", &format!("FAILED: {}", e)).await;
+            }
+        }
+    }
+
+    /// Send PLC connection status to cloud server
+    pub async fn send_plc_status(&self, status: &PlcConnectionStatus) {
+        let msg_type = if status.connected { "plc_connected" } else { "plc_disconnected" };
+        let message = serde_json::to_string(status).unwrap_or_default();
+        self.send_plc_response(&format!("{}:{}", status.host, status.port), msg_type, &message).await;
     }
 
     /// Fire-and-forget UDP log via the stored logger

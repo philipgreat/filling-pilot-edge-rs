@@ -129,8 +129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         register_session.register().await;
     });
 
-    // Spawn PLC connection status checker
+    // Spawn PLC connection status checker and reporter
     let plc_s7 = Arc::clone(&s7_manager);
+    let plc_cloud = Arc::clone(&cloud_session);
     let plc_logger = Arc::clone(&logger);
     let plc_status_handle = tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(10)); // Check every 10 seconds
@@ -151,9 +152,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     format!("PLC {}:{} DISCONNECTED", status.host, status.port)
                 };
                 info!("[PLC_STATUS] {}", status_str);
+                
+                // Log locally
                 let l = Arc::clone(&plc_logger);
                 let msg = status_str.clone();
                 tokio::spawn(async move { l.log("PLC_STATUS", &msg).await; });
+                
+                // Report to cloud server
+                let cloud = Arc::clone(&plc_cloud);
+                let status_clone = status.clone();
+                tokio::spawn(async move {
+                    cloud.send_plc_status(&status_clone).await;
+                });
             }
         }
     });
