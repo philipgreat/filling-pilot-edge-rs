@@ -20,6 +20,8 @@ pub struct S7Manager {
     connections: Arc<RwLock<HashMap<String, SharedConnection>>>,
     /// Default config
     config: S7Config,
+    /// PLC configuration list from cloud (ip, port)
+    plc_list: Arc<RwLock<Vec<PlcConfig>>>,
 }
 
 impl S7Manager {
@@ -27,7 +29,33 @@ impl S7Manager {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             config: S7Config::default(),
+            plc_list: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Update PLC list from cloud configuration
+    pub async fn update_plc_list(&self, plcs: Vec<PlcConfig>) {
+        let mut list = self.plc_list.write().await;
+        *list = plcs.clone();
+        info!("[S7] Updated PLC list: {} PLCs", list.len());
+        
+        // Pre-create connections for all PLCs
+        for plc in &plcs {
+            let key = format!("{}:{}", plc.ip, plc.port);
+            let mut pool = self.connections.write().await;
+            if !pool.contains_key(&key) {
+                let mut config = self.config.clone();
+                config.host = plc.ip.clone();
+                config.port = plc.port;
+                let connector = S7Connection::new(config);
+                pool.insert(key, Arc::new(RwLock::new(connector)));
+            }
+        }
+    }
+
+    /// Get current PLC list
+    pub async fn get_plc_list(&self) -> Vec<PlcConfig> {
+        self.plc_list.read().await.clone()
     }
 
     /// Get or create a shared connection for the given PLC
@@ -141,34 +169,32 @@ impl S7Manager {
         }
     }
 
-    /// Get all connection keys in the pool
-    pub async fn get_connection_keys(&self) -> Vec<String> {
-        let pool = self.connections.read().await;
-        pool.keys().cloned().collect()
-    }
-
-    /// Check all connections and return status map
+    /// Check all PLCs from the configured list and return status map
     pub async fn check_all_connections(&self) -> Vec<PlcConnectionStatus> {
-        let keys = self.get_connection_keys().await;
+        let plcs = self.get_plc_list().await;
         let mut results = Vec::new();
         
-        for key in keys {
-            let parts: Vec<&str> = key.split(':').collect();
-            if parts.len() == 2 {
-                let host = parts[0];
-                let port: u16 = parts[1].parse().unwrap_or(102);
-                let (connected, latency) = self.test_connection(host, port).await;
-                results.push(PlcConnectionStatus {
-                    host: host.to_string(),
-                    port,
-                    connected,
-                    latency_ms: latency,
-                });
-            }
+        for plc in plcs {
+            let (connected, latency) = self.test_connection(&plc.ip, plc.port).await;
+            results.push(PlcConnectionStatus {
+                host: plc.ip.clone(),
+                port: plc.port,
+                connected,
+                latency_ms: latency,
+            });
         }
         
         results
     }
+}
+
+/// PLC configuration from cloud
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlcConfig {
+    #[serde(rename = "ipAddress")]
+    pub ip: String,
+    #[serde(rename = "portNumber")]
+    pub port: u16,
 }
 
 /// PLC connection status

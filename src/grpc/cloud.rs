@@ -24,7 +24,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::context::Context;
 use crate::logger::Logger;
-use crate::s7::PlcConnectionStatus;
+use crate::s7::{PlcConnectionStatus, PlcConfig};
 
 /// Cloud session - manages gRPC connection to cloud server
 pub struct CloudSession {
@@ -44,11 +44,14 @@ pub struct CloudSession {
     port: u16,
     /// UDP logger
     udp_logger: Arc<Logger>,
+    /// S7 Manager reference for updating PLC list
+    #[allow(dead_code)]
+    s7_manager: std::sync::Arc<crate::s7::S7Manager>,
 }
 
 impl CloudSession {
     /// Create a new cloud session
-    pub fn new(ctx: &Context, udp_logger: Arc<Logger>) -> Self {
+    pub fn new(ctx: &Context, udp_logger: Arc<Logger>, s7_manager: std::sync::Arc<crate::s7::S7Manager>) -> Self {
         let random_number = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -63,6 +66,7 @@ impl CloudSession {
             server_address: ctx.server_address.clone(),
             port: ctx.port,
             udp_logger,
+            s7_manager,
         }
     }
 
@@ -290,9 +294,18 @@ impl CloudSession {
 
     /// Handle a server command
     async fn handle_command(&self, cmd: &pb::ServerCommand) {
-        info!("[CMD] Handling: type={}, detail={}", cmd.r#type, cmd.detail);
+        info!("[CMD] Handling: type={}", cmd.r#type);
         
         match cmd.r#type.as_str() {
+            "plcInfo" => {
+                // Parse PLC list from detail and update S7Manager
+                let plcs = self.parse_plc_list(&cmd.detail).await;
+                let count = plcs.len();
+                if !plcs.is_empty() {
+                    self.s7_manager.update_plc_list(plcs).await;
+                }
+                self.log_udp("CMD", &format!("plcInfo: {} PLCs configured", count)).await;
+            }
             "upgrade" => {
                 self.log_udp("CMD", "Received upgrade command (not implemented yet)").await;
             }
@@ -310,6 +323,28 @@ impl CloudSession {
                 self.log_udp("CMD", &format!("Unknown command type: {}", cmd.r#type)).await;
             }
         }
+    }
+
+    /// Parse PLC list from JSON detail
+    async fn parse_plc_list(&self, detail: &str) -> Vec<PlcConfig> {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(detail) {
+            if let Some(arr) = json.as_array() {
+                let mut plcs = Vec::new();
+                for item in arr {
+                    if let (Some(ip), Some(port)) = (
+                        item.get("ipAddress").and_then(|v| v.as_str()),
+                        item.get("portNumber").and_then(|v| v.as_u64())
+                    ) {
+                        plcs.push(PlcConfig {
+                            ip: ip.to_string(),
+                            port: port as u16,
+                        });
+                    }
+                }
+                return plcs;
+            }
+        }
+        Vec::new()
     }
 
     /// Send PLC response to cloud server via gRPC send() method

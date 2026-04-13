@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log_udp!("STARTUP", "Cloud Server: {}:{}", context.server_address, context.port);
 
     // Create cloud session and connect
-    let cloud_session = Arc::new(CloudSession::new(&context, Arc::clone(&logger)));
+    let cloud_session = Arc::new(CloudSession::new(&context, Arc::clone(&logger), Arc::clone(&s7_manager)));
     
     // Connect to cloud server
     match cloud_session.connect().await {
