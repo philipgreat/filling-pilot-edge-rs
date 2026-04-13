@@ -238,6 +238,12 @@ impl CloudSession {
                     let plc_summary = self.extract_plc_summary(&cmd.detail);
                     self.log_udp("HEARTBEAT", &format!("plc={}", plc_summary)).await;
                 }
+                
+                // Process any commands in the heartbeat response (like Java ServerCommandObserver)
+                // This handles plcInfo type commands to update PLC configuration
+                if !cmd.r#type.is_empty() {
+                    self.handle_command(&cmd).await;
+                }
             }
             Err(e) => {
                 warn!("[HEARTBEAT] failed: {}", e);
