@@ -11,6 +11,7 @@ pub mod s7;
 pub mod http;
 pub mod error;
 pub mod logger;
+pub mod report;
 
 pub use context::Context;
 pub use error::{Error, Result};

@@ -12,6 +12,7 @@ pub mod pb {
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tokio::time::{interval, Duration};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
@@ -25,6 +26,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::context::Context;
 use crate::logger::Logger;
 use crate::s7::{PlcConnectionStatus, PlcConfig};
+use crate::report::{ReportCache, FillStation, Monitor, MonitorProcessor};
 
 /// Cloud session - manages gRPC connection to cloud server
 pub struct CloudSession {
@@ -32,12 +34,12 @@ pub struct CloudSession {
     client: RwLock<Option<pb::filling_pilot_client::FillingPilotClient<Channel>>>,
     /// Edge node ID
     id: String,
-    /// Random number generated once at startup
-    random_number: i64,
+    /// Random number for ECN authentication (atomic for dynamic update from reConnect)
+    random_number: AtomicI64,
     /// ECDSA signing key (Base64 PEM encoded)
     private_key_pem: String,
-    /// Heartbeat interval in milliseconds
-    heart_beat_ms: u64,
+    /// Heartbeat interval in milliseconds (atomic for dynamic update from server config)
+    heart_beat_ms: AtomicU64,
     /// Cloud server address
     server_address: String,
     /// Cloud server port
@@ -45,14 +47,23 @@ pub struct CloudSession {
     /// UDP logger
     udp_logger: Arc<Logger>,
     /// S7 Manager reference for updating PLC list
-    #[allow(dead_code)]
     s7_manager: std::sync::Arc<crate::s7::S7Manager>,
+    /// Last PLC info detail (skip redundant TCP tests when unchanged)
+    last_plc_detail: std::sync::Mutex<String>,
+    /// Report cache (for report/status reading and sending)
+    report_cache: Arc<ReportCache>,
+    /// Monitor processor (for monitor reading and sending)
+    monitor_processor: Arc<MonitorProcessor>,
+    /// Report interval in ms (atomic for dynamic update)
+    report_interval_ms: AtomicU64,
+    /// Status interval in ms (atomic for dynamic update)
+    status_interval_ms: AtomicU64,
 }
 
 impl CloudSession {
     /// Create a new cloud session
     pub fn new(ctx: &Context, udp_logger: Arc<Logger>, s7_manager: std::sync::Arc<crate::s7::S7Manager>) -> Self {
-        let random_number = std::time::SystemTime::now()
+        let random_number_init = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
@@ -60,13 +71,18 @@ impl CloudSession {
         Self {
             client: RwLock::new(None),
             id: ctx.id.clone(),
-            random_number,
+            random_number: AtomicI64::new(random_number_init),
             private_key_pem: ctx.private_key.clone().unwrap_or_default(),
-            heart_beat_ms: ctx.heart_beat,
+            heart_beat_ms: AtomicU64::new(ctx.heart_beat),
             server_address: ctx.server_address.clone(),
             port: ctx.port,
             udp_logger,
-            s7_manager,
+            s7_manager: s7_manager.clone(),
+            last_plc_detail: std::sync::Mutex::new(String::new()),
+            report_cache: Arc::new(ReportCache::new(s7_manager.clone())),
+            monitor_processor: Arc::new(MonitorProcessor::new(s7_manager)),
+            report_interval_ms: AtomicU64::new(ctx.report_interval),
+            status_interval_ms: AtomicU64::new(ctx.status_interval),
         }
     }
 
@@ -102,14 +118,14 @@ impl CloudSession {
             }
         };
 
-        // Sign: SHA256(data as big-endian i64 bytes) — matches Java ByteUtil.longToBytes
+        // Sign: SHA256(data as big-endian i64 bytes) - matches Java ByteUtil.longToBytes
         let mut hasher = Sha256::new();
         hasher.update(&data.to_be_bytes());
         let hash = hasher.finalize();
 
         let signature: Signature = signing_key.sign(&hash);
         
-        // Hex encode signature bytes — matches Java Hex.encodeHexString(sig.toByteArray())
+        // Hex encode signature bytes - matches Java Hex.encodeHexString(sig.toByteArray())
         hex::encode(signature.to_bytes())
     }
 
@@ -117,16 +133,20 @@ impl CloudSession {
     fn build_ecn_info(&self) -> pb::EcnInfo {
         pb::EcnInfo {
             id: self.id.clone(),
-            random_number: self.random_number,
-            sign: self.sign(self.random_number),
+            random_number: self.random_number.load(Ordering::Relaxed),
+            sign: self.sign(self.random_number.load(Ordering::Relaxed)),
         }
+    }
+
+    /// Check if gRPC client is connected
+    pub async fn is_connected(&self) -> bool {
+        self.client.read().await.is_some()
     }
 
     /// Connect to the cloud server
     pub async fn connect(&self) -> Result<(), String> {
         let addr = format!("http://{}:{}", self.server_address, self.port);
         
-        info!("[CLOUD] Connecting to {}:{}", self.server_address, self.port);
         self.log_udp("CLOUD", &format!("Connecting to cloud server: {}:{}", self.server_address, self.port)).await;
 
         match tonic::transport::Endpoint::new(addr)
@@ -137,7 +157,6 @@ impl CloudSession {
             Ok(channel) => {
                 let client = pb::filling_pilot_client::FillingPilotClient::new(channel);
                 *self.client.write().await = Some(client);
-                info!("[CLOUD] Connected to cloud server");
                 self.log_udp("CLOUD", "Connected to cloud server").await;
                 Ok(())
             }
@@ -150,11 +169,25 @@ impl CloudSession {
         }
     }
 
-    /// Register with cloud server — runs on startup, keeps streaming for commands
+    /// Register with cloud server - runs on startup, keeps streaming for commands
     pub async fn register(&self) {
+        // Loop: re-register when server sends reConnect (matches Java behavior)
+        loop {
+            let result = self.register_once().await;
+            if result {
+                // ReConnect received, loop again with updated random
+                continue;
+            }
+            // Stream ended or error, stop
+            break;
+        }
+    }
+
+    /// Single register attempt (returns true if reConnect was received)
+    async fn register_once(&self) -> bool {
         let ecn_info = self.build_ecn_info();
         
-        self.log_udp("REGISTER", &format!("Sending register (id={}, random={})", self.id, self.random_number)).await;
+        self.log_udp("REGISTER", &format!("Sending register (id={}, random={})", self.id, self.random_number.load(Ordering::Relaxed))).await;
 
         // Try to get mutable client from read lock then upgrade... 
         // For simplicity, hold the write lock during register
@@ -165,7 +198,7 @@ impl CloudSession {
                 client.register(req).await
             } else {
                 self.log_udp("REGISTER", "Not connected, skipping register").await;
-                return;
+                return false;
             }
         };
 
@@ -183,71 +216,107 @@ impl CloudSession {
                             } else {
                                 String::new()
                             };
-                            info!("[CMD] type={}{}", cmd.r#type, plc_summary);
                             self.log_udp("CMD", &format!("type={}{}", cmd.r#type, plc_summary)).await;
-                            self.handle_command(&cmd).await;
+                            if self.handle_command(&cmd).await { return true; }
                         }
                         Err(e) => {
                             warn!("[REGISTER] stream error: {}", e);
                             self.log_udp("REGISTER", &format!("Stream error: {}", e)).await;
-                            break;
+                            return false;
                         }
                     }
                 }
                 self.log_udp("REGISTER", "Command stream ended").await;
+                return false;
             }
             Err(e) => {
                 warn!("[REGISTER] failed: {}", e);
                 self.log_udp("REGISTER", &format!("Register failed: {}", e)).await;
+                return false;
             }
         }
     }
 
-    /// Start heartbeat loop — runs forever until shutdown
-    pub async fn start_heartbeat_loop(&self) {
-        info!("[HEARTBEAT] Starting loop (interval={}ms)", self.heart_beat_ms);
-        self.log_udp("HEARTBEAT", &format!("Starting heartbeat loop (interval={}ms)", self.heart_beat_ms)).await;
+        /// Update heartbeat interval (called when server sends new config)
+    pub fn update_heartbeat(&self, ms: u64) {
+        let old = self.heart_beat_ms.load(Ordering::Relaxed);
+        if old != ms {
+            self.heart_beat_ms.store(ms, Ordering::Relaxed);
+            info!("[HEARTBEAT] Interval updated: {}ms -> {}ms", old, ms);
+        }
+    }
 
-        let mut tick = interval(Duration::from_millis(self.heart_beat_ms));
+    /// Start heartbeat loop - runs forever until shutdown (matches Java keepHeartBeat)
+    pub async fn start_heartbeat_loop(&self) {
+        let mut hb_ms = self.heart_beat_ms.load(Ordering::Relaxed);
+        self.log_udp("HEARTBEAT", &format!("Starting heartbeat loop (interval={}ms)", hb_ms)).await;
+
+        let mut tick = interval(Duration::from_millis(hb_ms));
         
         loop {
             tick.tick().await;
+            
+            // Check if heartbeat interval was updated dynamically
+            let current_ms = self.heart_beat_ms.load(Ordering::Relaxed);
+            if current_ms != hb_ms {
+                info!("[HEARTBEAT] Interval changed: {}ms -> {}ms, resetting ticker", hb_ms, current_ms);
+                tick = interval(Duration::from_millis(current_ms));
+                hb_ms = current_ms;
+            }
+            
+            // Java keepHeartBeat: sendHeartBeat() every tick, errors don't break the loop
             self.send_heartbeat().await;
         }
     }
 
-    /// Send one heartbeat and log the result
+    /// Send one heartbeat and log the result (matches Java sendHeartBeat)
     async fn send_heartbeat(&self) {
         let ecn_info = self.build_ecn_info();
 
-        let mut guard = self.client.write().await;
-        let client = match guard.as_mut() {
-            Some(c) => c,
-            None => return,
-        };
+        // Send heartbeat and get response (hold lock only during gRPC call)
+        let result = {
+            let mut guard = self.client.write().await;
+            let client = match guard.as_mut() {
+                Some(c) => c,
+                None => {
+                    self.log_udp("HEARTBEAT", "SKIP (client not connected)").await;
+                    return;
+                }
+            };
 
-        let req = tonic::Request::new(ecn_info);
-        
-        match client.heart_beat(req).await {
-            Ok(response) => {
-                let cmd = response.into_inner();
-                info!("[HEARTBEAT] OK, server response: type={}", cmd.r#type);
-                self.log_udp("HEARTBEAT", &format!("OK (id={}, random={})", self.id, self.random_number)).await;
+            let req = tonic::Request::new(ecn_info);
+            // Log sending heartbeat
+            self.log_udp("HB_SEND", &format!(
+                "id={}, random={}, server={}:{}",
+                self.id, self.random_number.load(Ordering::Relaxed), self.server_address, self.port
+            )).await;
+            
+            // Send heartbeat and collect response (lock released after this block)
+            client.heart_beat(req).await.map(|r| r.into_inner())
+        };  // Lock released here!
+
+        match result {
+            Ok(cmd) => {
+                // Log received heartbeat response (no lock held)
+                self.log_udp("HB_RECV", &format!(
+                    "OK id={}, random={}, resp_type={}, detail_len={}",
+                    self.id, self.random_number.load(Ordering::Relaxed), cmd.r#type, cmd.detail.len()
+                )).await;
+                
+                // Process PLC info summary from detail
                 if !cmd.detail.is_empty() {
-                    // Parse detail and extract only PLC info (ipAddress, portNumber)
                     let plc_summary = self.extract_plc_summary(&cmd.detail);
-                    self.log_udp("HEARTBEAT", &format!("plc={}", plc_summary)).await;
+                    self.log_udp("HB_RECV", &format!("detail={}", plc_summary)).await;
                 }
                 
-                // Process any commands in the heartbeat response (like Java ServerCommandObserver)
-                // This handles plcInfo type commands to update PLC configuration
+                // Process any commands (safe now — lock is released)
                 if !cmd.r#type.is_empty() {
-                    self.handle_command(&cmd).await;
+                    let _reconnect = self.handle_command(&cmd).await;
                 }
             }
             Err(e) => {
                 warn!("[HEARTBEAT] failed: {}", e);
-                self.log_udp("HEARTBEAT", &format!("FAILED: {}", e)).await;
+                self.log_udp("HB_RECV", &format!("FAILED: {}", e)).await;
             }
         }
     }
@@ -299,22 +368,52 @@ impl CloudSession {
     }
 
     /// Handle a server command
-    async fn handle_command(&self, cmd: &pb::ServerCommand) {
-        info!("[CMD] Handling: type={}", cmd.r#type);
+    async fn handle_command(&self, cmd: &pb::ServerCommand) -> bool {
+
         
         match cmd.r#type.as_str() {
             "plcInfo" => {
+                // Skip if PLC info hasn't changed (avoid reconnecting every heartbeat)
+                {
+                    let last = self.last_plc_detail.lock().unwrap();
+                    if *last == cmd.detail {
+                        // Same PLC info, no need to re-test connections
+                        return false;
+                    }
+                }
+                
+                // PLC info changed, update cache
+                {
+                    let mut last = self.last_plc_detail.lock().unwrap();
+                    *last = cmd.detail.clone();
+                }
+                
                 // Parse PLC list from detail
                 let plcs = self.parse_plc_list(&cmd.detail).await;
                 let count = plcs.len();
                 
                 if plcs.is_empty() {
                     self.log_udp("PLC_INFO", "No PLCs in config").await;
-                    return;
+                    return false;
                 }
                 
                 // Update S7Manager with new PLC list
                 self.s7_manager.update_plc_list(plcs.clone()).await;
+                
+                // Parse fill stations and update report cache (like Java ReportCache.saveReportLocation)
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&cmd.detail) {
+                    if let Some(arr) = json.as_array() {
+                        let stations = FillStation::parse_from_plc_info(arr);
+                        if !stations.is_empty() {
+                            self.report_cache.update_fill_stations(stations).await;
+                        }
+                        // Parse monitors and update monitor processor (like Java MonitorProcessor.saveMonitors)
+                        let monitors = Monitor::parse_from_plc_info(arr);
+                        if !monitors.is_empty() {
+                            self.monitor_processor.update_monitors(monitors).await;
+                        }
+                    }
+                }
                 
                 // Test each PLC with TCP socket (like Java PlcInfo.handle)
                 for plc in &plcs {
@@ -332,7 +431,30 @@ impl CloudSession {
                 // Send final response: sendPlcResponse("plcInfo", "ok")
                 self.send_plc_response("plcInfo", "plcInfo", "ok").await;
                 
-                self.log_udp("PLC_INFO", &format!("Tested {} PLCs", count)).await;
+                self.log_udp("PLC_INFO", &format!("Tested {} PLCs (config changed)", count)).await;
+            }
+            "reConnect" | "reconnect" => {
+                // Java Reconnect.handle: update randomNumber then re-register
+                // Keep client alive so heartbeat continues working during re-registration
+                self.log_udp("RECONNECT", &format!("Received reconnect, updating random from {} to {}", 
+                    self.random_number.load(Ordering::Relaxed), cmd.detail)).await;
+                
+                // Parse new random number from detail
+                if let Ok(new_random) = cmd.detail.parse::<i64>() {
+                    self.random_number.store(new_random, Ordering::Relaxed);
+                } else {
+                    // If detail is not a number, generate a new one
+                    let new_random = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(self.random_number.load(Ordering::Relaxed) + 1);
+                    self.random_number.store(new_random, Ordering::Relaxed);
+                }
+                
+                // Break out of register stream to trigger re-register
+                // (the caller will re-invoke register() in a loop)
+                self.log_udp("RECONNECT", &format!("Re-registering with random={}", self.random_number.load(Ordering::Relaxed))).await;
+                return true;  // Signal caller to re-register
             }
             "upgrade" => {
                 self.log_udp("CMD", "Received upgrade command (not implemented yet)").await;
@@ -340,8 +462,141 @@ impl CloudSession {
             "restart" => {
                 self.log_udp("CMD", "Received restart command (not implemented yet)").await;
             }
+            "read" => {
+                // Java Read.handle: read from PLC, send response
+                self.log_udp("READ", &format!("detail_len={}", cmd.detail.len())).await;
+                match serde_json::from_str::<crate::s7::ReadRequest>(&cmd.detail) {
+                    Ok(read_req) => {
+                        let plc_id = read_req.plc_id.clone();
+                        match self.s7_manager.read_bytes(&read_req.ip, read_req.port, read_req.db_index, read_req.offset, read_req.size).await {
+                            Ok(data) => {
+                                let resp = crate::s7::ReadResponse {
+                                    request_id: read_req.request_id,
+                                    plc_id: read_req.plc_id.clone(),
+                                    ip: read_req.ip,
+                                    port: read_req.port,
+                                    db_index: read_req.db_index,
+                                    offset: read_req.offset,
+                                    success: true,
+                                    message: "OK".to_string(),
+                                    hex_content: Some(hex::encode(&data)),
+                                };
+                                let msg = serde_json::to_string(&resp).unwrap_or_default();
+                                self.send_plc_response(&plc_id, "read", &msg).await;
+                            }
+                            Err(e) => {
+                                let resp = crate::s7::ReadResponse {
+                                    request_id: read_req.request_id,
+                                    plc_id: read_req.plc_id.clone(),
+                                    ip: read_req.ip,
+                                    port: read_req.port,
+                                    db_index: read_req.db_index,
+                                    offset: read_req.offset,
+                                    success: false,
+                                    message: e.to_string(),
+                                    hex_content: None,
+                                };
+                                let msg = serde_json::to_string(&resp).unwrap_or_default();
+                                self.send_plc_response(&plc_id, "read", &msg).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.log_udp("READ", &format!("Failed to parse read request: {}", e)).await;
+                    }
+                }
+            }
+            "write" => {
+                // Java Write.handle: write to PLC, send response
+                self.log_udp("WRITE", &format!("detail_len={}", cmd.detail.len())).await;
+                match serde_json::from_str::<crate::s7::WriteRequest>(&cmd.detail) {
+                    Ok(write_req) => {
+                        let plc_id = write_req.plc_id.clone();
+                        let hex_content = write_req.hex_content.clone();
+                        match hex::decode(&hex_content) {
+                            Ok(data) => {
+                                match self.s7_manager.write_bytes(&write_req.ip, write_req.port, write_req.db_index, write_req.offset, &data).await {
+                                    Ok(()) => {
+                                        let resp = crate::s7::WriteResponse {
+                                            request_id: write_req.request_id,
+                                            plc_id: write_req.plc_id.clone(),
+                                            ip: write_req.ip,
+                                            port: write_req.port,
+                                            db_index: write_req.db_index,
+                                            offset: write_req.offset,
+                                            success: true,
+                                            message: "OK".to_string(),
+                                        };
+                                        let msg = serde_json::to_string(&resp).unwrap_or_default();
+                                        self.send_plc_response(&plc_id, "write", &msg).await;
+                                    }
+                                    Err(e) => {
+                                        let resp = crate::s7::WriteResponse {
+                                            request_id: write_req.request_id,
+                                            plc_id: write_req.plc_id.clone(),
+                                            ip: write_req.ip,
+                                            port: write_req.port,
+                                            db_index: write_req.db_index,
+                                            offset: write_req.offset,
+                                            success: false,
+                                            message: e.to_string(),
+                                        };
+                                        let msg = serde_json::to_string(&resp).unwrap_or_default();
+                                        self.send_plc_response(&plc_id, "write", &msg).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.log_udp("WRITE", &format!("Invalid hex content: {}", e)).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.log_udp("WRITE", &format!("Failed to parse write request: {}", e)).await;
+                    }
+                }
+            }
+            "status" => {
+                // Java Status.handle: return all cached status
+                let statuses = self.report_cache.get_all_statuses().await;
+                let msg = serde_json::to_string(&statuses).unwrap_or_default();
+                self.send_plc_response("status", "status", &msg).await;
+            }
+            "ReportSubmitted" | "reportSubmitted" => {
+                // Java ReportSubmitted.handle: mark report as sent
+                if let Ok(report_id) = cmd.detail.parse::<i64>() {
+                    self.report_cache.delete_report(report_id).await;
+                    self.log_udp("REPORT_SUBMITTED", &format!("Deleted report {}", report_id)).await;
+                }
+            }
+            "clientInfo" => {
+                // Java VersionReport.handle: send version info
+                self.send_plc_response("", "clientInfo", &format!("clientVersion: {}", self.id)).await;
+            }
             "config" => {
-                self.log_udp("CMD", "Received config command (not implemented yet)").await;
+                self.log_udp("CMD", "Received config command").await;
+                // Try to parse detail as ServerConf JSON
+                if !cmd.detail.is_empty() {
+                    if let Ok(server_conf) = serde_json::from_str::<crate::context::ServerConf>(&cmd.detail) {
+                        self.log_udp("CONFIG", &format!(
+                            "heartBeat={}, reportInterval={}, statusInterval={}",
+                            server_conf.heart_beat, server_conf.report_interval, server_conf.status_interval
+                        )).await;
+                        // Update heartbeat interval dynamically
+                        if server_conf.heart_beat > 0 {
+                            self.update_heartbeat(server_conf.heart_beat);
+                        }
+                        // Update report/status intervals dynamically
+                        if server_conf.report_interval > 0 {
+                            self.report_interval_ms.store(server_conf.report_interval, Ordering::Relaxed);
+                        }
+                        if server_conf.status_interval > 0 {
+                            self.status_interval_ms.store(server_conf.status_interval, Ordering::Relaxed);
+                        }
+                    } else {
+                        self.log_udp("CONFIG", &format!("Failed to parse config detail: {}", &cmd.detail[..cmd.detail.len().min(100)])).await;
+                    }
+                }
             }
             _ if cmd.r#type.is_empty() => {
                 // Heartbeat response with no command
@@ -351,6 +606,7 @@ impl CloudSession {
                 self.log_udp("CMD", &format!("Unknown command type: {}", cmd.r#type)).await;
             }
         }
+        false
     }
 
     /// Parse PLC list from JSON detail
@@ -382,7 +638,7 @@ impl CloudSession {
         
         match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
             Ok(Ok(_stream)) => {
-                info!("[TCP_TEST] {}:{} connected", host, port);
+
                 true
             }
             Ok(Err(e)) => {
@@ -407,8 +663,8 @@ impl CloudSession {
             id: self.id.clone(),
             plc_id: plc_id.to_string(),
             r#type: msg_type.to_string(),
-            random_number: self.random_number,
-            sign: self.sign(self.random_number),
+            random_number: self.random_number.load(Ordering::Relaxed),
+            sign: self.sign(self.random_number.load(Ordering::Relaxed)),
             message: message.to_string(),
         };
 
@@ -427,7 +683,6 @@ impl CloudSession {
 
         match client.send(req).await {
             Ok(_) => {
-                info!("[SEND] PLC response sent: type={}, plcId={}", msg_type, plc_id);
                 self.log_udp("SEND", &format!("sent {} for {}", msg_type, plc_id)).await;
             }
             Err(e) => {
@@ -446,9 +701,88 @@ impl CloudSession {
 
     /// Fire-and-forget UDP log via the stored logger
     async fn log_udp(&self, name: &str, msg: &str) {
+        // Local log (always)
+        info!("[{}] {}", name, msg);
+        // UDP log (async, non-blocking)
         let l = Arc::clone(&self.udp_logger);
         let name = name.to_string();
         let msg = msg.to_string();
         tokio::spawn(async move { l.log(&name, &msg).await; });
+    }
+
+    // ===== Three background loops (matching Java Session.start()) =====
+
+    /// Report loop - reads PLC reports and sends to cloud (like Java keepReadReport)
+    /// Runs every reportInterval ms (default 5000ms)
+    pub async fn start_report_loop(self: Arc<Self>) {
+        let mut interval_ms = self.report_interval_ms.load(Ordering::Relaxed);
+        self.log_udp("REPORT", &format!("Starting report loop (interval={}ms)", interval_ms)).await;
+        let mut tick = interval(Duration::from_millis(interval_ms));
+
+        loop {
+            tick.tick().await;
+
+            // Check for interval update
+            let current_ms = self.report_interval_ms.load(Ordering::Relaxed);
+            if current_ms != interval_ms {
+                interval_ms = current_ms;
+                tick = interval(Duration::from_millis(interval_ms));
+                self.log_udp("REPORT", &format!("Interval updated to {}ms", interval_ms)).await;
+            }
+
+            // Read and send reports
+            let unsent = {
+                // Read from PLCs first
+                self.report_cache.read_and_send_reports_direct().await
+            };
+            
+            // Send unsent reports to cloud
+            for (msg_type, msg) in unsent {
+                self.send_plc_response("", &msg_type, &msg).await;
+            }
+        }
+    }
+
+    /// Status loop - reads PLC status DBs and sends to cloud (like Java keepReadStatus)
+    /// Runs every statusInterval ms (default 1000ms)
+    pub async fn start_status_loop(self: Arc<Self>) {
+        let mut interval_ms = self.status_interval_ms.load(Ordering::Relaxed);
+        self.log_udp("STATUS", &format!("Starting status loop (interval={}ms)", interval_ms)).await;
+        let mut tick = interval(Duration::from_millis(interval_ms));
+
+        loop {
+            tick.tick().await;
+
+            // Check for interval update
+            let current_ms = self.status_interval_ms.load(Ordering::Relaxed);
+            if current_ms != interval_ms {
+                interval_ms = current_ms;
+                tick = interval(Duration::from_millis(interval_ms));
+                self.log_udp("STATUS", &format!("Interval updated to {}ms", interval_ms)).await;
+            }
+
+            // Read status and send
+            let status_messages = self.report_cache.read_and_send_status_direct().await;
+            for (msg_type, msg) in status_messages {
+                self.send_plc_response("", &msg_type, &msg).await;
+            }
+        }
+    }
+
+    /// Monitor loop - triggers monitor reads (like Java keepTriggerMonitor)
+    /// Runs every 10ms (matches Java Thread.sleep(10))
+    pub async fn start_monitor_loop(self: Arc<Self>) {
+        self.log_udp("MONITOR", "Starting monitor loop (interval=10ms)").await;
+        let mut tick = interval(Duration::from_millis(10));
+
+        loop {
+            tick.tick().await;
+
+            // Trigger monitors and collect messages to send
+            let monitor_messages = self.monitor_processor.trigger_monitors_direct().await;
+            for (msg_type, msg) in monitor_messages {
+                self.send_plc_response("", &msg_type, &msg).await;
+            }
+        }
     }
 }

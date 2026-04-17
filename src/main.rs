@@ -14,6 +14,7 @@ mod s7;
 mod http;
 mod error;
 mod logger;
+mod report;
 
 use context::Context;
 use s7::S7Manager;
@@ -129,6 +130,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         register_session.register().await;
     });
 
+    // Spawn report loop (like Java keepReadReport, every reportInterval ms)
+    let report_session = Arc::clone(&cloud_session);
+    let report_handle = tokio::spawn(async move {
+        report_session.start_report_loop().await;
+    });
+
+    // Spawn status loop (like Java keepReadStatus, every statusInterval ms)
+    let status_session = Arc::clone(&cloud_session);
+    let status_handle = tokio::spawn(async move {
+        status_session.start_status_loop().await;
+    });
+
+    // Spawn monitor loop (like Java keepTriggerMonitor, every 10ms)
+    let monitor_session = Arc::clone(&cloud_session);
+    let monitor_handle = tokio::spawn(async move {
+        monitor_session.start_monitor_loop().await;
+    });
+
+    // Spawn connection watcher — reconnects if client is dropped by reConnect command
+    let watcher_session = Arc::clone(&cloud_session);
+    let _reconnect_handle = tokio::spawn(async move {
+        let mut tick = interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            if !watcher_session.is_connected().await {
+                log_udp!("RECONNECT", "Client disconnected, attempting to reconnect...");
+                if let Err(e) = watcher_session.connect().await {
+                    log_udp!("RECONNECT", "Connection failed");
+                    continue;
+                }
+                log_udp!("RECONNECT", "Reconnected, re-registering...");
+                watcher_session.register().await;
+                log_udp!("RECONNECT", "Reconnected and registered");
+            }
+        }
+    });
+
     // Spawn PLC connection status checker and reporter
     let plc_s7 = Arc::clone(&s7_manager);
     let plc_cloud = Arc::clone(&cloud_session);
@@ -177,6 +215,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     http_handle.abort();
     heartbeat_handle.abort();
     register_handle.abort();
+    report_handle.abort();
+    status_handle.abort();
+    monitor_handle.abort();
     plc_status_handle.abort();
 
     Ok(())

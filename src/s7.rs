@@ -47,7 +47,7 @@ impl S7Manager {
                 let mut config = self.config.clone();
                 config.host = plc.ip.clone();
                 config.port = plc.port;
-                let connector = S7Connection::new(config);
+                let mut connector = S7Connection::new(config);
                 pool.insert(key, Arc::new(RwLock::new(connector)));
             }
         }
@@ -75,7 +75,7 @@ impl S7Manager {
         config.host = host.to_string();
         config.port = port;
 
-        let connector = S7Connection::new(config);
+        let mut connector = S7Connection::new(config);
         let shared: SharedConnection = Arc::new(RwLock::new(connector));
 
         // Store in pool
@@ -85,18 +85,38 @@ impl S7Manager {
         Ok(shared)
     }
 
-    /// Connect to PLC
+    /// Connect to PLC (uses persistent connection pool, reconnects only if dead)
     async fn connect(&self, host: &str, port: u16) -> Result<SharedConnection> {
-        let shared = self.get_connection(host, port).await?;
-        let shared2 = shared.clone();
+        let key = format!("{}:{}", host, port);
+
+        // Fast path: connection pool already has a connected S7Connection
         {
-            let mut conn = shared.write().await;
-            conn.connect().await?;
+            let pool = self.connections.read().await;
+            if let Some(shared) = pool.get(&key) {
+                let conn = shared.read().await;
+                if conn.is_connected() {
+                    return Ok(shared.clone());
+                }
+            }
         }
-        Ok(shared2)
+
+        // Slow path: need to connect
+        let mut config = self.config.clone();
+        config.host = host.to_string();
+        config.port = port;
+
+        let mut connector = S7Connection::new(config);
+        connector.connect().await?;
+        let shared: SharedConnection = Arc::new(RwLock::new(connector));
+
+        // Store in pool
+        let mut pool = self.connections.write().await;
+        pool.insert(key.clone(), shared.clone());
+
+        Ok(shared)
     }
 
-    /// Read bytes from PLC data block
+    /// Read bytes from PLC data block (reuses persistent connection)
     pub async fn read_bytes(&self, host: &str, port: u16, db_number: u16, offset: u16, size: u16) -> Result<Vec<u8>> {
         let shared = self.connect(host, port).await?;
         let mut conn = shared.write().await;
@@ -148,19 +168,31 @@ impl S7Manager {
         }
     }
 
-    /// Test PLC connection status
+    /// Test PLC connection status (uses persistent connection, reconnects if dead)
     /// Returns (connected, latency_ms)
     pub async fn test_connection(&self, host: &str, port: u16) -> (bool, Option<u64>) {
         let start = std::time::Instant::now();
         
-        // Try to connect and read a small amount of data
-        match self.read_bytes(host, port, 1, 0, 1).await {
-            Ok(_) => {
-                let latency = start.elapsed().as_millis() as u64;
-                (true, Some(latency))
+        // connect() reuses existing connection if alive, reconnects only if dead
+        match self.connect(host, port).await {
+            Ok(shared) => {
+                let mut conn = shared.write().await;
+                // Try to read a small amount of data to verify connection is alive
+                match conn.read_db(1, 0, 1).await {
+                    Ok(_) => {
+                        let latency = start.elapsed().as_millis() as u64;
+                        (true, Some(latency))
+                    }
+                    Err(_) => {
+                        // Connection died, remove from pool so next call reconnects fresh
+                        let key = format!("{}:{}", host, port);
+                        let mut pool = self.connections.write().await;
+                        pool.remove(&key);
+                        (false, None)
+                    }
+                }
             }
             Err(_) => {
-                // Remove failed connection from pool
                 let key = format!("{}:{}", host, port);
                 let mut pool = self.connections.write().await;
                 pool.remove(&key);
