@@ -63,7 +63,7 @@ pub struct Context {
     pub id: String,
 
     /// Private key for ECDSA signing (Base64 encoded)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "privateKey", skip_serializing_if = "Option::is_none")]
     pub private_key: Option<String>,
 
     /// Heartbeat interval in milliseconds

@@ -223,6 +223,7 @@ impl S7Manager {
 /// PLC configuration from cloud
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlcConfig {
+    pub id: String,
     #[serde(rename = "ipAddress")]
     pub ip: String,
     #[serde(rename = "portNumber")]

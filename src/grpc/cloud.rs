@@ -1,7 +1,9 @@
 //! Cloud session - gRPC connection to cloud server
 //! 
 //! Implements:
-//! - ECDSA signing (ECDSA over P-256 + SHA-256, matches Java SHA256withECDSA)
+//! - ECDSA signing (direct signing with p256, matches Java's SHA256withECDSA)
+//!   NOTE: Java's SecureUtil.sign() internally hashes with SHA-256, so we pass raw bytes.
+//!         p256's Signer trait also hashes internally with SHA-256 automatically.
 //! - register() on startup (streaming ServerCommand responses)
 //! - heartBeat() every N ms
 //! - handle ServerCommand messages
@@ -17,9 +19,8 @@ use tokio::time::{interval, Duration};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 use tracing::{info, warn};
-use k256::ecdsa::{SigningKey, Signature, signature::Signer};
-use k256::pkcs8::DecodePrivateKey;
-use sha2::{Sha256, Digest};
+use p256::ecdsa::{SigningKey, Signature, signature::Signer};
+use p256::pkcs8::DecodePrivateKey;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -93,37 +94,47 @@ impl CloudSession {
     /// Output: hex string of signature bytes
     fn sign(&self, data: i64) -> String {
         if self.private_key_pem.is_empty() {
+            println!("[DEBUG_SIGN] private_key is EMPTY");
             return String::new();
         }
 
-        // Parse PEM-encoded private key
-        let signing_key = match SigningKey::from_pkcs8_pem(&self.private_key_pem) {
-            Ok(k) => k,
-            Err(_) => {
-                // Try raw Base64-decoded bytes
-                let bytes = match BASE64.decode(&self.private_key_pem) {
-                    Ok(b) => b,
+        // privateKey in id file is Base64-encoded PKCS#8 DER (not PEM)
+        let signing_key = match BASE64.decode(&self.private_key_pem) {
+            Ok(bytes) => {
+                println!("[DEBUG_SIGN] base64 decode OK, bytes_len={}", bytes.len());
+                match SigningKey::from_pkcs8_der(&bytes) {
+                    Ok(k) => {
+                        println!("[DEBUG_SIGN] from_pkcs8_der OK!");
+                        k
+                    },
                     Err(e) => {
-                        warn!("Failed to base64-decode private key: {}", e);
-                        return String::new();
+                        println!("[DEBUG_SIGN] from_pkcs8_der FAILED: {}, trying from_pkcs8_pem...", e);
+                        match SigningKey::from_pkcs8_pem(&self.private_key_pem) {
+                            Ok(k) => k,
+                            Err(e2) => {
+                                warn!("[SIGN] Failed to parse private key: pkcs8_der={}, pkcs8_pem={}", e, e2);
+                                return String::new();
+                            }
+                        }
                     }
-                };
-                match SigningKey::from_slice(&bytes) {
+                }
+            }
+            Err(e) => {
+                println!("[DEBUG_SIGN] base64 decode FAILED: {}, trying from_pkcs8_pem...", e);
+                match SigningKey::from_pkcs8_pem(&self.private_key_pem) {
                     Ok(k) => k,
-                    Err(e) => {
-                        warn!("Failed to parse private key bytes: {}", e);
+                    Err(e2) => {
+                        warn!("[SIGN] Failed to decode/parse private key: base64={}, pem={}", e, e2);
                         return String::new();
                     }
                 }
             }
         };
 
-        // Sign: SHA256(data as big-endian i64 bytes) - matches Java ByteUtil.longToBytes
-        let mut hasher = Sha256::new();
-        hasher.update(&data.to_be_bytes());
-        let hash = hasher.finalize();
-
-        let signature: Signature = signing_key.sign(&hash);
+        // Sign raw bytes directly - matches Java's SHA256withECDSA behavior
+        // Java: SecureUtil.sign() internally hashes with SHA-256, so we pass raw bytes
+        // Rust k256::ecdsa::Signer trait also hashes internally with SHA-256
+        let signature: Signature = signing_key.sign(&data.to_be_bytes());
         
         // Hex encode signature bytes - matches Java Hex.encodeHexString(sig.toByteArray())
         hex::encode(signature.to_bytes())
@@ -131,10 +142,12 @@ impl CloudSession {
 
     /// Build ECNInfo protobuf message
     fn build_ecn_info(&self) -> pb::EcnInfo {
+        let random_number = self.random_number.load(Ordering::Relaxed);
+        let sign = self.sign(random_number);
         pb::EcnInfo {
             id: self.id.clone(),
-            random_number: self.random_number.load(Ordering::Relaxed),
-            sign: self.sign(self.random_number.load(Ordering::Relaxed)),
+            random_number,
+            sign,
         }
     }
 
@@ -373,56 +386,60 @@ impl CloudSession {
         
         match cmd.r#type.as_str() {
             "plcInfo" => {
-                // Skip if PLC info hasn't changed (avoid reconnecting every heartbeat)
-                {
+                // Java PlcInfo.handle: always process and send plcInfo responses every heartbeat.
+                // Server marks PLC online with 60s TTL, so we must respond each time.
+                // Internal state (S7Manager, monitors, report cache) only updates when config changes.
+                let config_changed = {
                     let last = self.last_plc_detail.lock().unwrap();
-                    if *last == cmd.detail {
-                        // Same PLC info, no need to re-test connections
-                        return false;
-                    }
-                }
+                    *last != cmd.detail
+                };
                 
-                // PLC info changed, update cache
-                {
-                    let mut last = self.last_plc_detail.lock().unwrap();
-                    *last = cmd.detail.clone();
-                }
-                
-                // Parse PLC list from detail
+                // Parse PLC list from detail (always needed for TCP test + plcInfo response)
                 let plcs = self.parse_plc_list(&cmd.detail).await;
-                let count = plcs.len();
                 
                 if plcs.is_empty() {
                     self.log_udp("PLC_INFO", "No PLCs in config").await;
                     return false;
                 }
                 
-                // Update S7Manager with new PLC list
-                self.s7_manager.update_plc_list(plcs.clone()).await;
-                
-                // Parse fill stations and update report cache (like Java ReportCache.saveReportLocation)
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&cmd.detail) {
-                    if let Some(arr) = json.as_array() {
-                        let stations = FillStation::parse_from_plc_info(arr);
-                        if !stations.is_empty() {
-                            self.report_cache.update_fill_stations(stations).await;
-                        }
-                        // Parse monitors and update monitor processor (like Java MonitorProcessor.saveMonitors)
-                        let monitors = Monitor::parse_from_plc_info(arr);
-                        if !monitors.is_empty() {
-                            self.monitor_processor.update_monitors(monitors).await;
+                // Update internal state only when config changes
+                if config_changed {
+                    self.log_udp("PLC_INFO", "Config changed, updating internal state...").await;
+                    {
+                        let mut last = self.last_plc_detail.lock().unwrap();
+                        *last = cmd.detail.clone();
+                    }
+                    
+                    // Update S7Manager with new PLC list
+                    self.s7_manager.update_plc_list(plcs.clone()).await;
+                    
+                    // Parse fill stations and update report cache (like Java ReportCache.saveReportLocation)
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&cmd.detail) {
+                        if let Some(arr) = json.as_array() {
+                            let stations = FillStation::parse_from_plc_info(arr);
+                            if !stations.is_empty() {
+                                self.report_cache.update_fill_stations(stations).await;
+                            }
+                            // Parse monitors and update monitor processor (like Java MonitorProcessor.saveMonitors)
+                            let monitors = Monitor::parse_from_plc_info(arr);
+                            if !monitors.is_empty() {
+                                self.monitor_processor.update_monitors(monitors).await;
+                            }
                         }
                     }
                 }
                 
-                // Test each PLC with TCP socket (like Java PlcInfo.handle)
+                // Test each PLC with TCP socket (like Java PlcInfo.handle) — EVERY heartbeat
+                let mut count = 0usize;
                 for plc in &plcs {
                     let result = self.test_tcp_connection(&plc.ip, plc.port).await;
                     let msg_type = if result { "plcInfo" } else { "plcInfoFail" };
                     let message = if result { "ok" } else { "failed" };
+                    if result { count += 1; }
                     
                     // Send response for each PLC: sendPlcResponse(id, "plcInfo", "ok")
-                    self.send_plc_response(&format!("{}:{}", plc.ip, plc.port), msg_type, message).await;
+                    // Java: String id = (String) plc.get("id"); session.sendPlcResponse(id, ...)
+                    self.send_plc_response(&plc.id, msg_type, message).await;
                     
                     // Sleep 50ms between each PLC (like Java)
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -431,7 +448,7 @@ impl CloudSession {
                 // Send final response: sendPlcResponse("plcInfo", "ok")
                 self.send_plc_response("plcInfo", "plcInfo", "ok").await;
                 
-                self.log_udp("PLC_INFO", &format!("Tested {} PLCs (config changed)", count)).await;
+                self.log_udp("PLC_INFO", &format!("Tested {} PLCs, {} online{}", plcs.len(), count, if config_changed { " (config changed)" } else { "" })).await;
             }
             "reConnect" | "reconnect" => {
                 // Java Reconnect.handle: update randomNumber then re-register
@@ -615,11 +632,13 @@ impl CloudSession {
             if let Some(arr) = json.as_array() {
                 let mut plcs = Vec::new();
                 for item in arr {
-                    if let (Some(ip), Some(port)) = (
+                    if let (Some(id), Some(ip), Some(port)) = (
+                        item.get("id").and_then(|v| v.as_str()),
                         item.get("ipAddress").and_then(|v| v.as_str()),
                         item.get("portNumber").and_then(|v| v.as_u64())
                     ) {
                         plcs.push(PlcConfig {
+                            id: id.to_string(),
                             ip: ip.to_string(),
                             port: port as u16,
                         });
@@ -659,14 +678,23 @@ impl CloudSession {
     /// This is called when PLC status changes or data needs to be reported.
     /// Uses bidirectional streaming to send PlcResponse messages.
     pub async fn send_plc_response(&self, plc_id: &str, msg_type: &str, message: &str) {
+        let random_number = self.random_number.load(Ordering::Relaxed);
+        let sign = self.sign(random_number);
+
         let plc_response = pb::PlcResponse {
             id: self.id.clone(),
             plc_id: plc_id.to_string(),
             r#type: msg_type.to_string(),
-            random_number: self.random_number.load(Ordering::Relaxed),
-            sign: self.sign(self.random_number.load(Ordering::Relaxed)),
+            random_number,
+            sign: sign.clone(),
             message: message.to_string(),
         };
+
+        // Log full PlcResponse content before sending
+        self.log_udp("SEND_DETAIL", &format!(
+            "PlcResponse {{ id: {}, plc_id: {}, type: {}, random_number: {}, sign: {}, message: {} }}",
+            self.id, plc_id, msg_type, random_number, sign, message
+        )).await;
 
         let mut guard = self.client.write().await;
         let client = match guard.as_mut() {
@@ -694,7 +722,7 @@ impl CloudSession {
 
     /// Send PLC connection status to cloud server
     pub async fn send_plc_status(&self, status: &PlcConnectionStatus) {
-        let msg_type = if status.connected { "plc_connected" } else { "plc_disconnected" };
+        let msg_type = if status.connected { "plcInfo" } else { "plcInfoFail" };
         let message = serde_json::to_string(status).unwrap_or_default();
         self.send_plc_response(&format!("{}:{}", status.host, status.port), msg_type, &message).await;
     }
