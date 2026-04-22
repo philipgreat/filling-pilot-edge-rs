@@ -7,6 +7,7 @@
 //! - Deleting submitted reports
 
 use std::collections::{HashMap, LinkedList, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -14,6 +15,14 @@ use tracing::{info, warn};
 use crate::s7::S7Manager;
 use super::fill_station::FillStation;
 use super::plc_report::PlcReport;
+
+/// Reports persistence file: ~/.edge/reports.json
+fn reports_file_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".edge")
+        .join("reports.json")
+}
 
 /// Current time in milliseconds
 pub fn now_millis() -> u64 {
@@ -36,12 +45,112 @@ pub struct ReportCache {
 }
 
 impl ReportCache {
-    pub fn new(s7_manager: Arc<S7Manager>) -> Self {
-        Self {
-            caches: Arc::new(RwLock::new(HashMap::new())),
-            status_cache: Arc::new(RwLock::new(HashMap::new())),
-            last_status_sent_time: Arc::new(RwLock::new(HashMap::new())),
+    pub fn new(s7_manager: Arc<S7Manager>) -> Arc<Self> {
+        let caches = Arc::new(RwLock::new(HashMap::new()));
+        let status_cache = Arc::new(RwLock::new(HashMap::new()));
+        let last_status_sent_time = Arc::new(RwLock::new(HashMap::new()));
+
+        let reports_file = reports_file_path();
+
+        // Load from disk on startup (matches Java: static block reads ~/.edge/reports.json)
+        let caches_load = Arc::clone(&caches);
+        let reports_file_load = reports_file.clone();
+        std::thread::spawn(move || {
+            Self::load_reports_from_disk(&caches_load, &reports_file_load);
+        });
+
+        // Start persistence loop: write to disk every 60 seconds (matches Java)
+        let caches_persist = Arc::clone(&caches);
+        let reports_file_persist = reports_file;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                Self::persist_reports_to_disk(&caches_persist, &reports_file_persist);
+            }
+        });
+
+        Arc::new(Self {
+            caches,
+            status_cache,
+            last_status_sent_time,
             s7_manager,
+        })
+    }
+
+    /// Load reports from ~/.edge/reports.json (called on startup, blocking)
+    fn load_reports_from_disk(caches: &Arc<RwLock<HashMap<FillStation, LinkedList<PlcReport>>>>, path: &PathBuf) {
+        if !path.exists() {
+            return;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                match serde_json::from_str::<HashMap<FillStation, Vec<PlcReport>>>(&content) {
+                    Ok(loaded) => {
+                        let count: usize = loaded.values().map(|v| v.len()).sum();
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        rt.block_on(async {
+                            let mut c = caches.write().await;
+                            for (station, reports) in loaded {
+                                let list: LinkedList<PlcReport> = reports.into_iter().collect();
+                                // Restore sent=true for restored reports (matches Java: reports start as unsent until explicitly sent)
+                                c.insert(station, list);
+                            }
+                        });
+                        info!("[REPORT] Loaded {} reports from {}", count, path.display());
+                    }
+                    Err(e) => {
+                        warn!("[REPORT] Failed to parse {}: {}", path.display(), e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("[REPORT] Failed to read {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    /// Persist reports to ~/.edge/reports.json (called every 60s, blocking)
+    fn persist_reports_to_disk(caches: &Arc<RwLock<HashMap<FillStation, LinkedList<PlcReport>>>>, path: &PathBuf) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let snapshot = rt.block_on(async {
+            let c = caches.read().await;
+            // Serialize as a map of station -> Vec<PlcReport>
+            // LinkedList doesn't serialize well, so convert to Vec
+            let mut map = serde_json::Map::new();
+            for (station, reports) in c.iter() {
+                let reports_vec: Vec<PlcReport> = reports.iter().cloned().collect();
+                let key = serde_json::to_string(station).unwrap_or_default();
+                map.insert(key, serde_json::to_value(reports_vec).unwrap_or_default());
+            }
+            map
+        });
+
+        if snapshot.is_empty() {
+            return;
+        }
+
+        // Ensure ~/.edge/ directory exists
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        match serde_json::to_string_pretty(&snapshot) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(path, json) {
+                    warn!("[REPORT] Failed to write {}: {}", path.display(), e);
+                } else {
+                    info!("[REPORT] Persisted reports to {}", path.display());
+                }
+            }
+            Err(e) => {
+                warn!("[REPORT] Failed to serialize reports: {}", e);
+            }
         }
     }
 

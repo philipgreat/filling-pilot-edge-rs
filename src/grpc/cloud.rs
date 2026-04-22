@@ -88,7 +88,7 @@ impl CloudSession {
             udp_logger,
             s7_manager: s7_manager.clone(),
             last_plc_detail: std::sync::Mutex::new(String::new()),
-            report_cache: Arc::new(ReportCache::new(s7_manager.clone())),
+            report_cache: ReportCache::new(s7_manager.clone()),
             monitor_processor: Arc::new(MonitorProcessor::new(s7_manager, meta_factory.clone())),
             meta_factory,
             report_interval_ms: AtomicU64::new(ctx.report_interval),
