@@ -19,6 +19,25 @@ use crate::codec::{DataBlockDefinition, PropertyType};
 use crate::s7::S7Manager;
 use crate::error::Result;
 
+/// In-memory log buffer (last 1000 lines, matching Java Logger)
+static LOG_BUFFER: std::sync::LazyLock<Mutex<Vec<String>>> = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+use std::sync::Mutex;
+
+/// Add a log entry to the buffer (call this from handlers)
+pub fn add_log(message: impl Into<String>) {
+    if let Ok(mut logs) = LOG_BUFFER.lock() {
+        let msg = message.into();
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let line = format!("[{}] {}", timestamp, msg);
+        logs.push(line);
+        // Keep last 1000 entries
+        if logs.len() > 1000 {
+            logs.remove(0);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     context: Context,
@@ -46,6 +65,10 @@ pub async fn start_server(context: Context, s7_manager: Arc<S7Manager>, port: u1
         .route("/read", post(read_handler))
         .route("/write", post(write_handler))
         .route("/health", get(health_handler))
+        // New endpoints matching Java
+        .route("/config", get(config_handler))
+        .route("/log", get(log_handler))
+        .route("/version", get(version_handler))
         .with_state(state);
 
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
@@ -226,4 +249,41 @@ async fn write_handler(
 
 async fn health_handler() -> &'static str {
     "OK"
+}
+
+/// GET /config - get/set configuration (matching Java)
+async fn config_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "serverAddress": state.context.server_address,
+        "port": state.context.port,
+        "upgradeUrl": state.context.upgrade_url,
+        "serverConfUrl": state.context.server_conf_url,
+        "version": state.context.version,
+        "id": state.context.id,
+        "privateKey": state.context.private_key,
+        "heartBeat": state.context.heart_beat,
+        "reportInterval": state.context.report_interval,
+        "statusInterval": state.context.status_interval,
+        "localPort": state.context.local_port,
+    }))
+}
+
+/// GET /log - view runtime logs (matching Java)
+async fn log_handler() -> Json<serde_json::Value> {
+    let logs = LOG_BUFFER.lock().unwrap();
+    // Return last 100 lines (matching Java: ~1000 entries limit)
+    let recent: Vec<String> = logs.iter().rev().take(100).cloned().collect();
+    Json(serde_json::json!({
+        "logs": recent,
+        "total": logs.len(),
+    }))
+}
+
+/// GET /version - get version info (matching Java)
+async fn version_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "name": env!("CARGO_PKG_NAME"),
+        "description": env!("CARGO_PKG_DESCRIPTION"),
+    }))
 }
