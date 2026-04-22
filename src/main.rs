@@ -15,12 +15,14 @@ mod http;
 mod error;
 mod logger;
 mod report;
+mod deploy;
 
 use context::Context;
 use s7::S7Manager;
 use processor::{StatusProcessor, VersionReportProcessor};
 use logger::{Logger, start_memory_reporter};
 use grpc::CloudSession;
+use deploy::PLCSerializeMetaFactory;
 use tokio::time::{interval, Duration};
 
 /// Global logger instance (initialized after context is loaded)
@@ -105,8 +107,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log_udp!("STARTUP", "HTTP API: http://0.0.0.0:{}", context.local_port);
     log_udp!("STARTUP", "Cloud Server: {}:{}", context.server_address, context.port);
 
+    // Create metadata factory (singleton, shared across cloud session and monitors)
+    let meta_factory = PLCSerializeMetaFactory::new();
+
     // Create cloud session and connect
-    let cloud_session = Arc::new(CloudSession::new(&context, Arc::clone(&logger), Arc::clone(&s7_manager)));
+    let cloud_session = Arc::new(CloudSession::new(&context, Arc::clone(&logger), Arc::clone(&s7_manager), Arc::clone(&meta_factory)));
     
     // Connect to cloud server
     match cloud_session.connect().await {
@@ -147,6 +152,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let monitor_handle = tokio::spawn(async move {
         monitor_session.start_monitor_loop().await;
     });
+
+    // Start monitor persistence (load from disk + 60s persistence loop)
+    let mp = cloud_session.get_monitor_processor();
+    mp.load_from_disk();
+    mp.start_persistence_loop();
 
     // Spawn connection watcher — reconnects if client is dropped by reConnect command
     let watcher_session = Arc::clone(&cloud_session);

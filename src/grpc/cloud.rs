@@ -28,6 +28,7 @@ use crate::context::Context;
 use crate::logger::Logger;
 use crate::s7::{PlcConnectionStatus, PlcConfig};
 use crate::report::{ReportCache, FillStation, Monitor, MonitorProcessor};
+use crate::deploy::PLCSerializeMetaFactory;
 
 /// Cloud session - manages gRPC connection to cloud server
 pub struct CloudSession {
@@ -55,6 +56,8 @@ pub struct CloudSession {
     report_cache: Arc<ReportCache>,
     /// Monitor processor (for monitor reading and sending)
     monitor_processor: Arc<MonitorProcessor>,
+    /// Metadata factory for codec decoding and deploy
+    meta_factory: Arc<PLCSerializeMetaFactory>,
     /// Report interval in ms (atomic for dynamic update)
     report_interval_ms: AtomicU64,
     /// Status interval in ms (atomic for dynamic update)
@@ -63,7 +66,12 @@ pub struct CloudSession {
 
 impl CloudSession {
     /// Create a new cloud session
-    pub fn new(ctx: &Context, udp_logger: Arc<Logger>, s7_manager: std::sync::Arc<crate::s7::S7Manager>) -> Self {
+    pub fn new(
+        ctx: &Context,
+        udp_logger: Arc<Logger>,
+        s7_manager: std::sync::Arc<crate::s7::S7Manager>,
+        meta_factory: Arc<PLCSerializeMetaFactory>,
+    ) -> Self {
         let random_number_init = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -81,7 +89,8 @@ impl CloudSession {
             s7_manager: s7_manager.clone(),
             last_plc_detail: std::sync::Mutex::new(String::new()),
             report_cache: Arc::new(ReportCache::new(s7_manager.clone())),
-            monitor_processor: Arc::new(MonitorProcessor::new(s7_manager)),
+            monitor_processor: Arc::new(MonitorProcessor::new(s7_manager, meta_factory.clone())),
+            meta_factory,
             report_interval_ms: AtomicU64::new(ctx.report_interval),
             status_interval_ms: AtomicU64::new(ctx.status_interval),
         }
@@ -418,13 +427,22 @@ impl CloudSession {
                         if let Some(arr) = json.as_array() {
                             let stations = FillStation::parse_from_plc_info(arr);
                             if !stations.is_empty() {
-                                self.report_cache.update_fill_stations(stations).await;
+                                // Clone stations for update_fill_stations since it consumes the vec
+                                let stations_clone = stations.clone();
+                                self.report_cache.update_fill_stations(stations_clone).await;
                             }
                             // Parse monitors and update monitor processor (like Java MonitorProcessor.saveMonitors)
                             let monitors = Monitor::parse_from_plc_info(arr);
                             if !monitors.is_empty() {
                                 self.monitor_processor.update_monitors(monitors).await;
                             }
+                            // Save DataBlockDefinition metadata (like Java PLCSerializeMetaFactory.saveMeta)
+                            self.monitor_processor.save_meta(arr).await;
+                            // Update fill stations map for deploy callbacks
+                            let fs_list: Vec<(String, String, u16)> = stations.iter()
+                                .map(|s| (s.id.clone(), s.ip.clone(), s.port))
+                                .collect();
+                            self.monitor_processor.update_fill_stations(fs_list).await;
                         }
                     }
                 }
@@ -736,6 +754,11 @@ impl CloudSession {
         let name = name.to_string();
         let msg = msg.to_string();
         tokio::spawn(async move { l.log(&name, &msg).await; });
+    }
+
+    /// Get monitor processor (for main.rs to start persistence loop)
+    pub fn get_monitor_processor(&self) -> Arc<MonitorProcessor> {
+        Arc::clone(&self.monitor_processor)
     }
 
     // ===== Three background loops (matching Java Session.start()) =====
