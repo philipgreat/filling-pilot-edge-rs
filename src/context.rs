@@ -194,7 +194,7 @@ impl Context {
         let server_conf_path = format!("{}/serverConf", cwd);
 
         // Read id file
-        let id_content = fs::read_to_string("id").map_err(|source| ContextError::IdFileNotFound {
+        let id_content = fs::read_to_string("id.key").map_err(|source| ContextError::IdFileNotFound {
             source,
             id_path: id_path.clone(),
             cwd: cwd.clone(),
@@ -212,7 +212,7 @@ impl Context {
         // Deserialize into Context
         let mut ctx: Context = serde_json::from_value(json_value).map_err(|_source| {
             ContextError::MissingField {
-                field: "id",
+                field: "id.key",
                 id_path: id_path.clone(),
                 cwd: cwd.clone(),
             }
@@ -221,14 +221,14 @@ impl Context {
         // Validate required id field
         if ctx.id.is_empty() {
             return Err(ContextError::MissingField {
-                field: "id",
+                field: "id.key",
                 id_path: id_path.clone(),
                 cwd: cwd.clone(),
             });
         }
 
         // Read serverConf file (required)
-        let server_conf_content = fs::read_to_string("serverConf").map_err(|source| ContextError::ServerConfNotFound {
+        let server_conf_content = fs::read_to_string("server.conf").map_err(|source| ContextError::ServerConfNotFound {
             source,
             conf_path: server_conf_path.clone(),
             cwd: cwd.clone(),
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn test_context_serde() {
         let json = r#"{
-            "id": "test-123",
+            "id.key": "test-123",
             "server_address": "192.168.1.100",
             "port": 8888
         }"#;
